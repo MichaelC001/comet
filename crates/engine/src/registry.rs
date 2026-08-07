@@ -145,6 +145,8 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-1".into(),
                 is_error: false,
+                output: None,
+                diff: None,
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
@@ -156,6 +158,8 @@ pub fn default_registry() -> HarnessRegistry {
             AgentEvent::ToolResult {
                 id: "mock-tool-2".into(),
                 is_error: false,
+                output: None,
+                diff: None,
             },
             AgentEvent::TextDelta {
                 text: "The `SegmentWriter` appends into `LoroText` so the oplog stays RLE-merged:\n\n```rust\nfolded = fold_event_into_parts(&folded, &event);\nwriter.sync(&folded)?; // 120ms coalesced commits\n```\n\nSynced to every device through the session room. *Mock harness reporting in.*".into(),
@@ -210,6 +214,20 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
+    // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
+    // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
+    // steers deliver at turn boundaries; the effort ladder is empty until
+    // ACP session config options are wired.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Grok,
+            name: "Grok".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -249,12 +267,17 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
+    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Grok
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
@@ -262,6 +285,13 @@ mod tests {
         // cheap; CLI discovery is deferred to models()/run()).
         let codex = registry.resolve(HarnessId::Codex).unwrap();
         assert_eq!(codex.id(), HarnessId::Codex);
+        // Grok resolves through the shared ACP harness; its descriptor must
+        // mirror the resolved harness (descriptor-stability rule).
+        let grok = registry.resolve(HarnessId::Grok).unwrap();
+        assert_eq!(grok.id(), HarnessId::Grok);
+        assert_eq!(grok.display_name(), "Grok");
+        assert_eq!(grok.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(grok.reasoning_levels().is_empty());
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`

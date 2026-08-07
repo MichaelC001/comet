@@ -193,6 +193,109 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    /// Expandable detail: capped output lines or an inline diff (ACP
+    /// harnesses). Empty = no detail affordance on the chip. Precomputed here
+    /// because rows are cached by fingerprint — diffing per paint would run
+    /// on every scroll frame.
+    pub detail: Arc<Vec<DetailLine>>,
+}
+
+/// One line of a chip's expandable detail block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailLine {
+    pub kind: DetailKind,
+    pub text: SharedString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailKind {
+    /// Plain output / unchanged diff context.
+    Context,
+    Add,
+    Del,
+    /// Elision + truncation markers ("… 12 more lines").
+    Meta,
+}
+
+/// Max rendered detail lines per chip — the analytic fold height depends on
+/// this cap, and a chip is a summary, not a pager.
+pub const DETAIL_MAX_LINES: usize = 12;
+
+/// Reduce a tool part's output/diff to capped display lines. A diff wins over
+/// raw output (it is the more structured record of the same action); context
+/// runs collapse to `⋯` keeping one line of context around each change.
+pub fn tool_detail_lines(
+    output: Option<&str>,
+    diff: Option<&comet_proto::ToolDiff>,
+) -> Vec<DetailLine> {
+    let mut lines: Vec<DetailLine> = Vec::new();
+    if let Some(diff) = diff {
+        let old = diff.old_text.as_deref().unwrap_or("");
+        let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
+        let all: Vec<(DetailKind, String)> = text_diff
+            .iter_all_changes()
+            .map(|change| {
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => DetailKind::Del,
+                    similar::ChangeTag::Insert => DetailKind::Add,
+                    similar::ChangeTag::Equal => DetailKind::Context,
+                };
+                (kind, change.value().trim_end_matches('\n').to_owned())
+            })
+            .collect();
+        let keep: Vec<bool> = all
+            .iter()
+            .enumerate()
+            .map(|(ix, (kind, _))| {
+                *kind != DetailKind::Context
+                    || (ix > 0 && all[ix - 1].0 != DetailKind::Context)
+                    || all
+                        .get(ix + 1)
+                        .is_some_and(|(k, _)| *k != DetailKind::Context)
+            })
+            .collect();
+        let mut skipping = false;
+        for (ix, (kind, text)) in all.iter().enumerate() {
+            if !keep[ix] {
+                if !skipping {
+                    lines.push(DetailLine {
+                        kind: DetailKind::Meta,
+                        text: "⋯".into(),
+                    });
+                    skipping = true;
+                }
+                continue;
+            }
+            skipping = false;
+            let marker = match kind {
+                DetailKind::Add => "+ ",
+                DetailKind::Del => "- ",
+                _ => "  ",
+            };
+            lines.push(DetailLine {
+                kind: *kind,
+                text: format!("{marker}{}", single_line(text)).into(),
+            });
+        }
+    } else if let Some(output) = output {
+        lines.extend(output.lines().map(|line| DetailLine {
+            kind: DetailKind::Context,
+            text: single_line(line).into(),
+        }));
+        // Trim trailing blank output lines so the block hugs its content.
+        while lines.last().is_some_and(|l| l.text.trim().is_empty()) {
+            lines.pop();
+        }
+    }
+    if lines.len() > DETAIL_MAX_LINES {
+        let rest = lines.len() - (DETAIL_MAX_LINES - 1);
+        lines.truncate(DETAIL_MAX_LINES - 1);
+        lines.push(DetailLine {
+            kind: DetailKind::Meta,
+            text: format!("… {rest} more lines").into(),
+        });
+    }
+    lines
 }
 
 #[derive(Clone)]
@@ -293,6 +396,12 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.extend_from_slice(label.as_bytes());
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        // Detail payload arriving (or growing) must re-splice the row even
+        // when the resolved bit didn't change.
+        acc.extend_from_slice(&(t.detail.len() as u32).to_le_bytes());
+        for line in t.detail.iter() {
+            acc.extend_from_slice(&(line.text.len() as u32).to_le_bytes());
+        }
     }
     acc.push(auto_open as u8);
     fnv1a(&acc)
@@ -382,12 +491,15 @@ pub fn rows_for_entry(
                 call,
                 is_error,
                 resolved,
+                output,
+                diff,
                 ..
             } => {
                 pending_group.push(ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
+                    detail: Arc::new(tool_detail_lines(output.as_deref(), diff.as_ref())),
                 });
                 group_last_part_ix = part_ix;
             }
@@ -692,6 +804,19 @@ pub fn chips_height(count: usize) -> f32 {
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
 }
 
+/// Per-line height of a chip's expanded detail block.
+pub const DETAIL_LINE_HEIGHT: f32 = 17.0;
+/// Vertical padding + bottom margin of an open detail block.
+pub const DETAIL_BLOCK_EXTRA: f32 = 16.0;
+
+/// Analytic height of one open detail block (0 when there is nothing to show).
+pub fn detail_height(lines: usize) -> f32 {
+    if lines == 0 {
+        return 0.0;
+    }
+    lines as f32 * DETAIL_LINE_HEIGHT + DETAIL_BLOCK_EXTRA
+}
+
 // ---------------------------------------------------------------------------
 // Working indicator flavour (pure; rendered by the shell strip)
 // ---------------------------------------------------------------------------
@@ -870,6 +995,9 @@ pub struct Transcript {
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
+    /// Open detail blocks (output/diff) per chip, keyed `"{row_id}#d{ix}"`.
+    /// Render-local like `folds` — never part of the row fingerprint.
+    tool_details: HashMap<SharedString, bool>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -955,6 +1083,7 @@ impl Transcript {
             live_parsers: HashMap::new(),
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
+            tool_details: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -1329,14 +1458,10 @@ impl Transcript {
         rows
     }
 
-    fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, auto_open: bool) {
+    fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
-        entry.from = if currently_open {
-            chips_height(tool_count)
-        } else {
-            0.0
-        };
+        entry.from = if currently_open { open_height } else { 0.0 };
         entry.open = Some(!currently_open);
         entry.epoch += 1;
         entry.toggled_at = Some(Instant::now());
@@ -1862,11 +1987,30 @@ impl Transcript {
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
-        let target = if open { chips_height(tools.len()) } else { 0.0 };
+        // Which chips have their detail block open (render-local, analytic).
+        let detail_opens: Vec<bool> = tools
+            .iter()
+            .enumerate()
+            .map(|(ix, tool)| {
+                !tool.detail.is_empty()
+                    && self
+                        .tool_details
+                        .get(&SharedString::from(format!("{row_id}#d{ix}")))
+                        .copied()
+                        .unwrap_or(false)
+            })
+            .collect();
+        let open_height = chips_height(tools.len())
+            + tools
+                .iter()
+                .zip(&detail_opens)
+                .filter(|(_, open)| **open)
+                .map(|(tool, _)| detail_height(tool.detail.len()))
+                .sum::<f32>();
+        let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
 
         let toggle_id = row_id.clone();
-        let tool_count = tools.len();
         // Header (comet tool-group.tsx): a small chevron tile centered over the
         // chips' guide rail, then the quiet 12px summary.
         let header = div()
@@ -1887,7 +2031,7 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
+                this.toggle_fold(toggle_id.clone(), open_height, auto_open);
                 cx.notify();
             }))
             .child(
@@ -1915,7 +2059,30 @@ impl Transcript {
             .flex()
             .flex_col()
             .gap(px(CHIP_GAP))
-            .children(tools.iter().map(|tool| tool_chip(tool, theme)));
+            .children(tools.iter().enumerate().map(|(ix, tool)| {
+                let expandable = !tool.detail.is_empty();
+                let detail_open = detail_opens[ix];
+                let chip = tool_chip(tool, expandable, detail_open, theme);
+                if !expandable {
+                    return chip;
+                }
+                let key = SharedString::from(format!("{row_id}#d{ix}"));
+                let mut column = div().flex().flex_col().w_full().flex_none().child(
+                    div()
+                        .id(key.clone())
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let open = this.tool_details.entry(key.clone()).or_insert(false);
+                            *open = !*open;
+                            cx.notify();
+                        }))
+                        .child(chip),
+                );
+                if detail_open {
+                    column = column.child(detail_block(&tool.detail, theme));
+                }
+                column.into_any_element()
+            }));
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
         // only within a short window of the click. Auto-open (streaming) and
@@ -2175,7 +2342,43 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// One tool chip row: a guide rail on the left (continuous across stacked
 /// chips — the rail spans the row's full height) threading the chips to their
 /// group toggle, then the chip card (comet tool-chip.tsx).
-fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
+/// The expanded output/diff block under a chip: quiet mono lines, additions
+/// and deletions tinted like the changes pane, meta rows muted.
+fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
+    div()
+        // Indent past the guide rail so the block hangs under the chip card.
+        .ml(px(25.0))
+        .mb(px(4.0))
+        .rounded(px(9.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.07))
+        .bg(crate::theme::ink(0.03))
+        .px(px(8.0))
+        .py(px(6.0))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .font_family(theme.font_mono.clone())
+        .text_size(px(11.0))
+        .children(lines.iter().map(|line| {
+            let color = match line.kind {
+                DetailKind::Add => theme.diff_add,
+                DetailKind::Del => theme.diff_del,
+                DetailKind::Meta => theme.text_muted.opacity(0.7),
+                DetailKind::Context => theme.text.opacity(0.75),
+            };
+            div()
+                .h(px(DETAIL_LINE_HEIGHT))
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_color(color)
+                .child(line.text.clone())
+        }))
+        .into_any_element()
+}
+
+fn tool_chip(tool: &ToolItem, expandable: bool, detail_open: bool, theme: &Theme) -> AnyElement {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
         theme.danger
@@ -2250,7 +2453,18 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                             theme.text.opacity(0.85)
                         })
                         .child(SharedString::from(detail)),
-                ),
+                )
+                .when(expandable, |card| {
+                    // Output/diff affordance: a quiet chevron that flips while
+                    // the detail block is open (clicking the chip toggles it).
+                    card.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child(SharedString::from(if detail_open { "▾" } else { "▸" })),
+                    )
+                }),
         )
         .into_any_element()
 }
@@ -2567,6 +2781,8 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            output: None,
+            diff: None,
         }
     }
 
@@ -2835,11 +3051,50 @@ mod tests {
     }
 
     #[test]
+    fn detail_lines_diff_collapses_context_and_caps() {
+        let diff = comet_proto::ToolDiff {
+            path: "/w/a.rs".into(),
+            old_text: Some("a\nb\nc\nd\ne\nf\ng\n".into()),
+            new_text: "a\nb\nc\nd\ne\nf\nG\n".into(),
+        };
+        let lines = tool_detail_lines(None, Some(&diff));
+        // Far context collapses to one ⋯ marker; one context line survives on
+        // each side of the change.
+        assert!(lines.iter().any(|l| l.kind == DetailKind::Meta));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DetailKind::Del && l.text.contains('g'))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DetailKind::Add && l.text.contains('G'))
+        );
+        assert!(lines.len() <= DETAIL_MAX_LINES);
+
+        // Output caps at DETAIL_MAX_LINES with a trailing count marker.
+        let output = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = tool_detail_lines(Some(&output), None);
+        assert_eq!(lines.len(), DETAIL_MAX_LINES);
+        let last = lines.last().unwrap();
+        assert_eq!(last.kind, DetailKind::Meta);
+        assert!(last.text.contains("more lines"), "{}", last.text);
+
+        // Nothing → no affordance.
+        assert!(tool_detail_lines(None, None).is_empty());
+    }
+
+    #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
+            detail: Arc::new(Vec::new()),
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -2849,6 +3104,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            detail: Arc::new(Vec::new()),
         };
         let tools = vec![
             exec("ls"),
@@ -2874,6 +3130,7 @@ mod tests {
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
+                detail: Arc::new(Vec::new()),
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -2881,11 +3138,13 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                detail: Arc::new(Vec::new()),
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
+                detail: Arc::new(Vec::new()),
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
