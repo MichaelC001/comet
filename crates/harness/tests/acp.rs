@@ -611,6 +611,55 @@ fn descriptor_surface_matches_registry_expectations() {
     );
 }
 
+#[tokio::test]
+async fn models_are_discovered_from_the_acp_session() {
+    // ACP is the source of truth: the fixture advertises SessionModelState,
+    // so the picker list comes from the wire, not the static catalog.
+    let harness = AcpHarness::hermes().with_executable(fixture_path());
+    let models = harness.models().await.expect("discovery");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["grok-4-fast", "grok-4.5"], "{models:?}");
+    // Unmatched ids inherit the probe session's thought_level ladder.
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![
+            comet_proto::ReasoningLevel::Low,
+            comet_proto::ReasoningLevel::Medium,
+            comet_proto::ReasoningLevel::High,
+        ],
+        "{models:?}"
+    );
+    assert_eq!(models[0].description.as_deref(), Some("Fast tier"));
+    // Cached: a second call returns the same list without respawning.
+    let again = harness.models().await.expect("cached");
+    assert_eq!(again, models);
+}
+
+#[tokio::test]
+async fn models_enrich_from_the_static_catalog_on_id_match() {
+    // grok's static catalog knows "grok-4.5" — the discovered entry keeps the
+    // wire label but inherits the curated description and ladder.
+    let harness = AcpHarness::grok().with_executable(fixture_path());
+    let models = harness.models().await.expect("discovery");
+    let grok45 = models
+        .iter()
+        .find(|m| m.id == "grok-4.5")
+        .expect("grok-4.5");
+    assert_eq!(
+        grok45.description.as_deref(),
+        Some("xAI's coding model — 500k context"),
+        "{grok45:?}"
+    );
+}
+
+#[tokio::test]
+async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
+    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
+    let models = harness.models().await.expect("static fallback");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["default"], "{models:?}");
+}
+
 #[test]
 fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     let hermes = AcpHarness::hermes();

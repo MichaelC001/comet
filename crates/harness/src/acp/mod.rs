@@ -383,6 +383,9 @@ pub struct AcpHarness {
     kill_grace: Duration,
     /// Discovery result cache: the advertised commands survive across calls.
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Model discovery cache: only a successful, non-empty probe is cached,
+    /// so a mis-authed agent retries on the next picker open.
+    models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl AcpHarness {
@@ -393,6 +396,7 @@ impl AcpHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
+            models_cache: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -564,6 +568,138 @@ impl AcpHarness {
             Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
         }
     }
+
+    /// One short-lived probe for the agent's real model list: initialize →
+    /// `session/new`, then read the response's first-class `models`
+    /// (SessionModelState) with the `model` config option as fallback. The
+    /// wire is the source of truth — the spec's static catalog only enriches
+    /// matching entries and names the pick when the agent advertises nothing.
+    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let (mut child, _stderr) = self.spawn_agent(None)?;
+        let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
+            _ => {
+                shutdown_child(&mut child, self.kill_grace).await;
+                return Err(HarnessError::Protocol("agent child has no stdio".into()));
+            }
+        };
+        let discovery = async {
+            client.request("initialize", initialize_params()).await?;
+            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let session = client
+                .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+                .await?;
+            Ok::<Vec<Model>, HarnessError>(models_from_session(&session, &(self.spec.models)()))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("model discovery timed out".into())),
+        }
+    }
+}
+
+/// Map an advertised `thought_level` value id onto comet's ladder.
+fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
+    match norm_id(value).as_str() {
+        "minimal" => Some(ReasoningLevel::Minimal),
+        "low" => Some(ReasoningLevel::Low),
+        "medium" => Some(ReasoningLevel::Medium),
+        "high" => Some(ReasoningLevel::High),
+        "xhigh" => Some(ReasoningLevel::XHigh),
+        "max" => Some(ReasoningLevel::Max),
+        "ultra" => Some(ReasoningLevel::Ultra),
+        "ultracode" => Some(ReasoningLevel::Ultracode),
+        "ultrathink" => Some(ReasoningLevel::Ultrathink),
+        _ => None,
+    }
+}
+
+/// Derive the model list a `session/new` response advertises. Preference
+/// order mirrors paseo's ACP client: the first-class `models` state, then the
+/// `model` config option's choices; empty when the agent advertises neither.
+/// ACP carries no per-model effort metadata — every discovered model gets the
+/// probe session's `thought_level` ladder unless a static catalog entry with
+/// the same id supplies its own (the catalog also contributes label/
+/// description/options for matched ids, e.g. codex service tiers).
+fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
+    let ladder: Vec<ReasoningLevel> = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| o.get("value").and_then(Value::as_str))
+                .filter_map(reasoning_from_value)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let entry = |id: &str, name: Option<&str>, description: Option<&str>| -> Model {
+        let known = catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+        Model {
+            id: id.to_owned(),
+            label: name
+                .map(str::to_owned)
+                .or_else(|| known.map(|m| m.label.clone()))
+                .unwrap_or_else(|| id.to_owned()),
+            description: description
+                .map(str::to_owned)
+                .or_else(|| known.and_then(|m| m.description.clone())),
+            reasoning_levels: match known.filter(|m| !m.reasoning_levels.is_empty()) {
+                Some(m) => m.reasoning_levels.clone(),
+                None => ladder.clone(),
+            },
+            options: known.map(|m| m.options.clone()).unwrap_or_default(),
+        }
+    };
+
+    let advertised = session_response
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    if !advertised.is_empty() {
+        return advertised
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("modelId").and_then(Value::as_str)?;
+                Some(entry(
+                    id,
+                    m.get("name").and_then(Value::as_str),
+                    m.get("description").and_then(Value::as_str),
+                ))
+            })
+            .collect();
+    }
+
+    session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    let id = o.get("value").and_then(Value::as_str)?;
+                    Some(entry(
+                        id,
+                        o.get("name").and_then(Value::as_str),
+                        o.get("description").and_then(Value::as_str),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -584,11 +720,22 @@ impl Harness for AcpHarness {
         self.spec.reasoning_levels
     }
 
-    /// Static catalog; an absent binary surfaces as NotInstalled here, like
-    /// the codex harness.
+    /// ACP is the source of truth: a short-lived probe reads the agent's
+    /// advertised model list (cached on success). The spec's static catalog
+    /// answers when the agent advertises nothing or the probe fails — and an
+    /// absent binary still surfaces as NotInstalled, like before.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
-        Ok((self.spec.models)())
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        match self.discover_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                Ok(self.models_cache.get().cloned().unwrap_or(models))
+            }
+            Ok(_) | Err(_) => Ok((self.spec.models)()),
+        }
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {

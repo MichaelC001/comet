@@ -574,13 +574,6 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        // Model + traits merged into ONE menu (user request): the traits chip
-        // opens the combined harness/model/reasoning popover.
-        let kind = if kind == PickerKind::Traits {
-            PickerKind::HarnessModel
-        } else {
-            kind
-        };
         if self.open == Some(kind) {
             self.open = None;
             cx.notify();
@@ -1360,8 +1353,7 @@ impl Pickers {
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
         };
-        let open = self.open == Some(kind)
-            || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
+        let open = self.open == Some(kind);
         // Ghost pill (comet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
@@ -2061,15 +2053,12 @@ impl Pickers {
             ],
         };
 
-        // One combined menu (user request): harness tabs across the top,
-        // then the viewed harness's models, then the reasoning ladder and
-        // model options that used to live in the separate traits popover.
-        let traits = self.render_traits_sections(cx);
-        // The palette architecture: agents rail LEFT, models pane beside it
-        // with the traits INSPECTOR pinned below (models are the decision;
-        // reasoning/options are properties of it — they never scroll away
-        // with the list), legend footer under everything. FIXED height so
-        // harness switches and loading skeletons don't resize the card.
+        // The palette architecture: agents rail LEFT, models pane beside it,
+        // legend footer under everything. Reasoning/options live in the
+        // separate Traits dropdown (t3code TraitsPicker arrangement — they
+        // are properties of the selected model, so they follow the pick, not
+        // the browse). FIXED height so harness switches and loading
+        // skeletons don't resize the card.
         div()
             .h(px(420.0))
             .flex()
@@ -2121,19 +2110,6 @@ impl Pickers {
                                         .track_scroll(&model_scroll)
                                         .children(model_children),
                                 ),
-                            )
-                            .child(
-                                // The pinned inspector tray (scrolls only if
-                                // a model advertises many option groups).
-                                div()
-                                    .id("model-traits-scroll")
-                                    .flex_none()
-                                    .max_h(px(190.0))
-                                    .overflow_y_scroll()
-                                    .border_t_1()
-                                    .border_color(crate::theme::hairline(0.06))
-                                    .p(px(4.0))
-                                    .child(traits),
                             ),
                     ),
             )
@@ -2502,8 +2478,17 @@ impl Render for Pickers {
                     self.popover_frame_flush(460.0, content, cx),
                 ))
             }
-            // Traits merged into the HarnessModel popover.
-            Some(PickerKind::Traits) | None => None,
+            Some(PickerKind::Traits) => {
+                let content = div()
+                    .p(px(4.0))
+                    .child(self.render_traits_sections(cx))
+                    .into_any_element();
+                Some((
+                    PickerKind::Traits,
+                    self.popover_frame_flush(280.0, content, cx),
+                ))
+            }
+            None => None,
         };
 
         // Left cluster (the branch chip moved to the composer FOOTER row).
@@ -2516,19 +2501,35 @@ impl Render for Pickers {
             .items_center()
             .min_w_0()
             .gap(px(4.0));
-        // ONE combined model+effort chip (user request): brand icon + model
-        // name, then the effort level muted with no icon — a single button
-        // opening the single merged menu.
-        let combined_chip = self.trigger_chip(
+        // Model chip (brand icon + model name) beside a separate Traits chip
+        // (t3code TraitsPicker arrangement): the trigger label is the joined
+        // non-default summary ("High · 1M · Fast"), falling back to "Traits".
+        // No chip at all when the model has neither a ladder nor options
+        // (e.g. Hermes today) — a dead trigger reads as broken.
+        let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
             true,
             Some(harness_icon),
-            Some(traits_label),
+            None,
             &theme,
             cx,
         );
-        let _ = traits_set;
+        let has_traits = !self.trait_ladder(cx).is_empty()
+            || self
+                .selected_model(cx)
+                .is_some_and(|m| !m.options.is_empty());
+        let traits_chip = has_traits.then(|| {
+            self.trigger_chip(
+                PickerKind::Traits,
+                traits_label,
+                traits_set.is_some(),
+                None,
+                None,
+                &theme,
+                cx,
+            )
+        });
         let right = div()
             .flex()
             .flex_row()
@@ -2538,11 +2539,14 @@ impl Render for Pickers {
             // End-anchored: the menu's right edge sits flush with the chip's
             // right edge (user request), same as the footer's ref popover.
             .child(attach_overlay_end(
-                combined_chip,
+                model_chip,
                 &mut overlay,
                 PickerKind::HarnessModel,
                 "model-popover",
-            ));
+            ))
+            .children(traits_chip.map(|chip| {
+                attach_overlay_end(chip, &mut overlay, PickerKind::Traits, "traits-popover")
+            }));
         div()
             .w_full()
             .min_w_0()
