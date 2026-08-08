@@ -193,109 +193,156 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
-    /// Expandable detail: capped output lines or an inline diff (ACP
-    /// harnesses). Empty = no detail affordance on the chip. Precomputed here
-    /// because rows are cached by fingerprint — diffing per paint would run
-    /// on every scroll frame.
-    pub detail: Arc<Vec<DetailLine>>,
+    /// Expandable detail: a code-block of output lines, or a real diff
+    /// section rendered by the changes pane's component (ACP harnesses).
+    /// Precomputed here because rows are cached by fingerprint — diffing and
+    /// tokenizing per paint would run on every scroll frame.
+    pub detail: Option<Arc<ToolDetail>>,
 }
 
-/// One line of a chip's expandable detail block.
+/// A chip's expandable detail payload.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DetailLine {
-    pub kind: DetailKind,
-    pub text: SharedString,
+pub enum ToolDetail {
+    /// Command/tool output as a code block: verbatim lines (indentation
+    /// intact), capped at [`OUTPUT_DETAIL_MAX_LINES`] with a counted tail.
+    Output {
+        lines: Vec<SharedString>,
+        truncated_by: usize,
+    },
+    /// A file diff, in the changes pane's model: hunks with 3 lines of
+    /// context, dual line numbers, and (for recognized languages) syntax
+    /// tokens — rendered by `changes::render_file_body`.
+    Diff {
+        file: Arc<crate::changes::FileDiff>,
+        highlight: Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetailKind {
-    /// Plain output / unchanged diff context.
-    Context,
-    Add,
-    Del,
-    /// Elision + truncation markers ("… 12 more lines").
-    Meta,
-}
+/// Max verbatim output lines per chip before the counted tail row.
+pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 
-/// Max rendered detail lines per chip — the analytic fold height depends on
-/// this cap, and a chip is a summary, not a pager.
-pub const DETAIL_MAX_LINES: usize = 12;
+/// Per-line height of an output detail block (diff blocks use the changes
+/// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
+pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
 
-/// Reduce a tool part's output/diff to capped display lines. A diff wins over
-/// raw output (it is the more structured record of the same action); context
-/// runs collapse to `⋯` keeping one line of context around each change.
-pub fn tool_detail_lines(
+/// Vertical chrome of a detail card: py(6)×2 + border + bottom margin.
+const DETAIL_CARD_CHROME: f32 = 18.0;
+
+/// Build a tool part's expandable detail. A diff wins over raw output (it is
+/// the more structured record of the same action).
+pub fn tool_detail(
     output: Option<&str>,
     diff: Option<&comet_proto::ToolDiff>,
-) -> Vec<DetailLine> {
-    let mut lines: Vec<DetailLine> = Vec::new();
+) -> Option<ToolDetail> {
     if let Some(diff) = diff {
-        let old = diff.old_text.as_deref().unwrap_or("");
-        let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
-        let all: Vec<(DetailKind, String)> = text_diff
-            .iter_all_changes()
-            .map(|change| {
-                let kind = match change.tag() {
-                    similar::ChangeTag::Delete => DetailKind::Del,
-                    similar::ChangeTag::Insert => DetailKind::Add,
-                    similar::ChangeTag::Equal => DetailKind::Context,
-                };
-                (kind, change.value().trim_end_matches('\n').to_owned())
-            })
-            .collect();
-        let keep: Vec<bool> = all
-            .iter()
-            .enumerate()
-            .map(|(ix, (kind, _))| {
-                *kind != DetailKind::Context
-                    || (ix > 0 && all[ix - 1].0 != DetailKind::Context)
-                    || all
-                        .get(ix + 1)
-                        .is_some_and(|(k, _)| *k != DetailKind::Context)
-            })
-            .collect();
-        let mut skipping = false;
-        for (ix, (kind, text)) in all.iter().enumerate() {
-            if !keep[ix] {
-                if !skipping {
-                    lines.push(DetailLine {
-                        kind: DetailKind::Meta,
-                        text: "⋯".into(),
-                    });
-                    skipping = true;
-                }
-                continue;
-            }
-            skipping = false;
-            let marker = match kind {
-                DetailKind::Add => "+ ",
-                DetailKind::Del => "- ",
-                _ => "  ",
-            };
-            lines.push(DetailLine {
-                kind: *kind,
-                text: format!("{marker}{}", single_line(text)).into(),
-            });
+        let file = diff_to_file(diff);
+        if file.hunks.is_empty() {
+            return None;
         }
-    } else if let Some(output) = output {
-        lines.extend(output.lines().map(|line| DetailLine {
-            kind: DetailKind::Context,
-            text: single_line(line).into(),
-        }));
-        // Trim trailing blank output lines so the block hugs its content.
-        while lines.last().is_some_and(|l| l.text.trim().is_empty()) {
-            lines.pop();
-        }
-    }
-    if lines.len() > DETAIL_MAX_LINES {
-        let rest = lines.len() - (DETAIL_MAX_LINES - 1);
-        lines.truncate(DETAIL_MAX_LINES - 1);
-        lines.push(DetailLine {
-            kind: DetailKind::Meta,
-            text: format!("… {rest} more lines").into(),
+        let highlight = highlight_file(&file);
+        return Some(ToolDetail::Diff {
+            file: Arc::new(file),
+            highlight,
         });
     }
-    lines
+    let output = output?;
+    let mut lines: Vec<SharedString> = output
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    // Trim trailing blank output lines so the block hugs its content.
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Reduce an inline [`comet_proto::ToolDiff`] to the changes pane's
+/// [`crate::changes::FileDiff`]: hunks grouped with 3 context lines, dual
+/// 1-based line numbers, unified-diff hunk headers, and add/del counts.
+pub fn diff_to_file(diff: &comet_proto::ToolDiff) -> crate::changes::FileDiff {
+    use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+    let old = diff.old_text.as_deref().unwrap_or("");
+    let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
+    let mut hunks = Vec::new();
+    let (mut additions, mut deletions) = (0u32, 0u32);
+    for group in text_diff.grouped_ops(3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let old_range = first.old_range().start..last.old_range().end;
+        let new_range = first.new_range().start..last.new_range().end;
+        let header = format!(
+            "@@ -{},{} +{},{} @@",
+            old_range.start + 1,
+            old_range.len(),
+            new_range.start + 1,
+            new_range.len(),
+        );
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in text_diff.iter_changes(op) {
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => {
+                        deletions += 1;
+                        LineKind::Del
+                    }
+                    similar::ChangeTag::Insert => {
+                        additions += 1;
+                        LineKind::Add
+                    }
+                    similar::ChangeTag::Equal => LineKind::Context,
+                };
+                lines.push(DiffLine {
+                    kind,
+                    old_no: change.old_index().map(|n| n as u32 + 1),
+                    new_no: change.new_index().map(|n| n as u32 + 1),
+                    text: change.value().trim_end_matches('\n').to_owned(),
+                });
+            }
+        }
+        hunks.push(Hunk { header, lines });
+    }
+    FileDiff {
+        path: diff.path.clone(),
+        old_path: None,
+        status: if diff.old_text.is_none() {
+            FileStatus::Added
+        } else {
+            FileStatus::Modified
+        },
+        binary: false,
+        notices: Vec::new(),
+        hunks,
+        additions,
+        deletions,
+    }
+}
+
+/// Synchronous syntax tokens for a tool diff — the payload is doc-capped, so
+/// unlike the changes pane's time-sliced background pass this can run inline
+/// at row-build time (rows are fingerprint-cached, not per-frame).
+fn highlight_file(
+    file: &crate::changes::FileDiff,
+) -> Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>> {
+    use crate::markdown::highlight::{LineCarry, tokenize_line};
+    let lang = crate::changes::lang_for_path(&file.path)?;
+    let lines: Vec<Vec<crate::markdown::highlight::Token>> = file
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        // Diff lines are fragments — no carry across lines (changes.rs).
+        .map(|l| tokenize_line(lang, &l.text, LineCarry::None).0)
+        .collect();
+    Some(Arc::new(lines))
 }
 
 #[derive(Clone)]
@@ -398,9 +445,25 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
         // Detail payload arriving (or growing) must re-splice the row even
         // when the resolved bit didn't change.
-        acc.extend_from_slice(&(t.detail.len() as u32).to_le_bytes());
-        for line in t.detail.iter() {
-            acc.extend_from_slice(&(line.text.len() as u32).to_le_bytes());
+        match t.detail.as_deref() {
+            None => acc.push(0),
+            Some(ToolDetail::Output {
+                lines,
+                truncated_by,
+            }) => {
+                acc.push(1);
+                acc.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+                acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+                let bytes: usize = lines.iter().map(|l| l.len()).sum();
+                acc.extend_from_slice(&(bytes as u32).to_le_bytes());
+            }
+            Some(ToolDetail::Diff { file, .. }) => {
+                acc.push(2);
+                acc.extend_from_slice(file.path.as_bytes());
+                acc.extend_from_slice(&file.additions.to_le_bytes());
+                acc.extend_from_slice(&file.deletions.to_le_bytes());
+                acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+            }
         }
     }
     acc.push(auto_open as u8);
@@ -499,7 +562,7 @@ pub fn rows_for_entry(
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
-                    detail: Arc::new(tool_detail_lines(output.as_deref(), diff.as_ref())),
+                    detail: tool_detail(output.as_deref(), diff.as_ref()).map(Arc::new),
                 });
                 group_last_part_ix = part_ix;
             }
@@ -804,17 +867,19 @@ pub fn chips_height(count: usize) -> f32 {
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
 }
 
-/// Per-line height of a chip's expanded detail block.
-pub const DETAIL_LINE_HEIGHT: f32 = 17.0;
-/// Vertical padding + bottom margin of an open detail block.
-pub const DETAIL_BLOCK_EXTRA: f32 = 16.0;
-
-/// Analytic height of one open detail block (0 when there is nothing to show).
-pub fn detail_height(lines: usize) -> f32 {
-    if lines == 0 {
-        return 0.0;
+/// Analytic height of one open detail block — output blocks by line count,
+/// diff blocks via the changes pane's own [`crate::changes::body_height`].
+pub fn detail_height(detail: &ToolDetail) -> f32 {
+    match detail {
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => {
+            let rows = lines.len() + usize::from(*truncated_by > 0);
+            rows as f32 * OUTPUT_LINE_HEIGHT + DETAIL_CARD_CHROME
+        }
+        ToolDetail::Diff { file, .. } => crate::changes::body_height(file) + DETAIL_CARD_CHROME,
     }
-    lines as f32 * DETAIL_LINE_HEIGHT + DETAIL_BLOCK_EXTRA
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,7 +2057,7 @@ impl Transcript {
             .iter()
             .enumerate()
             .map(|(ix, tool)| {
-                !tool.detail.is_empty()
+                tool.detail.is_some()
                     && self
                         .tool_details
                         .get(&SharedString::from(format!("{row_id}#d{ix}")))
@@ -2005,7 +2070,7 @@ impl Transcript {
                 .iter()
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .map(|(tool, _)| detail_height(tool.detail.len()))
+                .filter_map(|(tool, _)| tool.detail.as_deref().map(detail_height))
                 .sum::<f32>();
         let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
@@ -2060,12 +2125,11 @@ impl Transcript {
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let expandable = !tool.detail.is_empty();
+                let Some(detail) = tool.detail.clone() else {
+                    return tool_chip(tool, false, false, theme);
+                };
                 let detail_open = detail_opens[ix];
-                let chip = tool_chip(tool, expandable, detail_open, theme);
-                if !expandable {
-                    return chip;
-                }
+                let chip = tool_chip(tool, true, detail_open, theme);
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
                 let mut column = div().flex().flex_col().w_full().flex_none().child(
                     div()
@@ -2079,7 +2143,7 @@ impl Transcript {
                         .child(chip),
                 );
                 if detail_open {
-                    column = column.child(detail_block(&tool.detail, theme));
+                    column = column.child(detail_block(&detail, theme));
                 }
                 column.into_any_element()
             }));
@@ -2339,17 +2403,15 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
     }
 }
 
-/// One tool chip row: a guide rail on the left (continuous across stacked
-/// chips — the rail spans the row's full height) threading the chips to their
-/// group toggle, then the chip card (comet tool-chip.tsx).
-/// The expanded output/diff block under a chip: a quiet mono card whose
-/// add/del rows carry a full-width wash in the changes-pane hues, so a diff
-/// reads at a glance (GitHub-style) instead of as colored plain text. Rows own
-/// the horizontal padding — the container has none — so washes reach the card
-/// edges; heights stay analytic ([`DETAIL_LINE_HEIGHT`] per row).
-fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
-    div()
-        // Indent past the guide rail so the block hangs under the chip card.
+/// The expanded block under a chip. Diffs render through the changes pane's
+/// section body — the real component, with hunk headers, dual line-number
+/// gutters, accent bars, row washes, and syntax runs — so an inline tool diff
+/// is indistinguishable from the checkout diff sidebar. Output renders as a
+/// code block: verbatim mono lines, indentation intact, counted-tail
+/// truncation. Both sit in the same quiet card hanging under the chip.
+fn detail_block(detail: &ToolDetail, theme: &Theme) -> AnyElement {
+    // Indent past the guide rail so the block hangs under the chip card.
+    let card = div()
         .ml(px(25.0))
         .mb(px(4.0))
         .rounded(px(9.0))
@@ -2359,30 +2421,46 @@ fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
         .py(px(6.0))
         .flex()
         .flex_col()
-        .overflow_hidden()
-        .font_family(theme.font_mono.clone())
-        .text_size(px(11.0))
-        .children(lines.iter().map(|line| {
-            let (color, wash) = match line.kind {
-                DetailKind::Add => (theme.diff_add, Some(theme.diff_add.opacity(0.11))),
-                DetailKind::Del => (theme.diff_del, Some(theme.diff_del.opacity(0.11))),
-                DetailKind::Meta => (theme.text_muted.opacity(0.6), None),
-                DetailKind::Context => (theme.text.opacity(0.82), None),
-            };
-            let mut row = div()
-                .h(px(DETAIL_LINE_HEIGHT))
-                .w_full()
-                .min_w_0()
-                .px(px(10.0))
-                .flex()
-                .items_center()
-                .text_color(color);
-            if let Some(wash) = wash {
-                row = row.bg(wash);
-            }
-            row.child(div().w_full().min_w_0().truncate().child(line.text.clone()))
-        }))
-        .into_any_element()
+        .overflow_hidden();
+    match detail {
+        ToolDetail::Diff { file, highlight } => card
+            .child(crate::changes::render_file_body(
+                file,
+                highlight.clone(),
+                theme,
+            ))
+            .into_any_element(),
+        ToolDetail::Output {
+            lines,
+            truncated_by,
+        } => card
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(lines.iter().map(|line| {
+                div()
+                    .h(px(OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .text_color(theme.text.opacity(0.85))
+                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
+            }))
+            .when(*truncated_by > 0, |block| {
+                block.child(
+                    div()
+                        .h(px(OUTPUT_LINE_HEIGHT))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                )
+            })
+            .into_any_element(),
+    }
 }
 
 fn tool_chip(tool: &ToolItem, expandable: bool, detail_open: bool, theme: &Theme) -> AnyElement {
@@ -3065,41 +3143,74 @@ mod tests {
     }
 
     #[test]
-    fn detail_lines_diff_collapses_context_and_caps() {
+    fn tool_diff_builds_real_hunks_with_context_and_numbers() {
+        use crate::changes::LineKind;
+        let old = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        let mut new = old.clone();
+        new[9] = "LINE 10".into();
         let diff = comet_proto::ToolDiff {
             path: "/w/a.rs".into(),
-            old_text: Some("a\nb\nc\nd\ne\nf\ng\n".into()),
-            new_text: "a\nb\nc\nd\ne\nf\nG\n".into(),
+            old_text: Some(old.join("\n") + "\n"),
+            new_text: new.join("\n") + "\n",
         };
-        let lines = tool_detail_lines(None, Some(&diff));
-        // Far context collapses to one ⋯ marker; one context line survives on
-        // each side of the change.
-        assert!(lines.iter().any(|l| l.kind == DetailKind::Meta));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DetailKind::Del && l.text.contains('g'))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.kind == DetailKind::Add && l.text.contains('G'))
-        );
-        assert!(lines.len() <= DETAIL_MAX_LINES);
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff)) else {
+            panic!("expected diff detail");
+        };
+        // One hunk: the change plus 3 context lines each side, real numbers.
+        assert_eq!(file.hunks.len(), 1);
+        let hunk = &file.hunks[0];
+        assert_eq!(hunk.header, "@@ -7,7 +7,7 @@");
+        assert_eq!(hunk.lines.len(), 8); // 6 context + 1 del + 1 add
+        let del = hunk
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Del)
+            .expect("del line");
+        assert_eq!(del.old_no, Some(10));
+        assert_eq!(del.new_no, None);
+        assert_eq!(del.text, "line 10");
+        let add = hunk
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Add)
+            .expect("add line");
+        assert_eq!(add.new_no, Some(10));
+        assert_eq!(add.text, "LINE 10");
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        // .rs path → syntax tokens computed, one entry per hunk line.
+        let highlight = highlight.expect("rust highlights");
+        assert_eq!(highlight.len(), hunk.lines.len());
+        // New files carry Added status (and no old numbers).
+        let created = comet_proto::ToolDiff {
+            path: "/w/new.txt".into(),
+            old_text: None,
+            new_text: "only\n".into(),
+        };
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created)) else {
+            panic!("expected diff detail");
+        };
+        assert_eq!(file.status, crate::changes::FileStatus::Added);
+        assert!(highlight.is_none(), ".txt has no language");
 
-        // Output caps at DETAIL_MAX_LINES with a trailing count marker.
+        // Output: verbatim lines (indentation intact), counted-tail cap.
         let output = (0..40)
-            .map(|i| format!("line {i}"))
+            .map(|i| format!("    indented {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = tool_detail_lines(Some(&output), None);
-        assert_eq!(lines.len(), DETAIL_MAX_LINES);
-        let last = lines.last().unwrap();
-        assert_eq!(last.kind, DetailKind::Meta);
-        assert!(last.text.contains("more lines"), "{}", last.text);
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = tool_detail(Some(&output), None)
+        else {
+            panic!("expected output detail");
+        };
+        assert_eq!(lines.len(), OUTPUT_DETAIL_MAX_LINES);
+        assert_eq!(truncated_by, 40 - OUTPUT_DETAIL_MAX_LINES);
+        assert_eq!(lines[0].as_ref(), "    indented 0");
 
         // Nothing → no affordance.
-        assert!(tool_detail_lines(None, None).is_empty());
+        assert!(tool_detail(None, None).is_none());
+        assert!(tool_detail(Some("\n\n"), None).is_none());
     }
 
     #[test]
@@ -3108,7 +3219,7 @@ mod tests {
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
-            detail: Arc::new(Vec::new()),
+            detail: None,
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -3118,7 +3229,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
-            detail: Arc::new(Vec::new()),
+            detail: None,
         };
         let tools = vec![
             exec("ls"),
@@ -3144,7 +3255,7 @@ mod tests {
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
-                detail: Arc::new(Vec::new()),
+                detail: None,
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -3152,13 +3263,13 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
-                detail: Arc::new(Vec::new()),
+                detail: None,
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
-                detail: Arc::new(Vec::new()),
+                detail: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");

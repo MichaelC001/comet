@@ -12,7 +12,7 @@ use comet_harness::{
 };
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, SteeringMode, TodoItem, ToolCall,
-    ToolDiff, UserInputAnswer,
+    UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -136,39 +136,56 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     );
 
     // Execute tool: pending opens the call, the completed update resolves it
-    // with capped output.
+    // with capped multi-line output (newlines preserved verbatim).
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "t1".into(),
         call: ToolCall::Exec {
-            command: "ls -la".into()
+            command: "cargo test -p comet-harness".into()
         },
     }));
-    assert!(events.contains(&AgentEvent::ToolResult {
-        id: "t1".into(),
-        is_error: false,
-        output: Some("total 0".into()),
-        diff: None,
-    }));
+    let exec_output = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                is_error: false,
+                output: Some(output),
+                ..
+            } if id == "t1" => Some(output.clone()),
+            _ => None,
+        })
+        .expect("exec output present");
+    assert!(exec_output.starts_with("   Compiling comet-harness"));
+    assert_eq!(exec_output.lines().count(), 6, "{exec_output:?}");
 
     // Edit tool: single-shot completed call carries the inline diff.
     assert!(events.contains(&AgentEvent::ToolCall {
         id: "t2".into(),
         call: ToolCall::EditFile {
-            path: "/w/main.rs".into(),
+            path: "/w/src/resolve.rs".into(),
             old_string: None,
             new_string: None,
         },
     }));
-    assert!(events.contains(&AgentEvent::ToolResult {
-        id: "t2".into(),
-        is_error: false,
-        output: None,
-        diff: Some(ToolDiff {
-            path: "/w/main.rs".into(),
-            old_text: Some("fn old() {}".into()),
-            new_text: "fn new() {}".into(),
-        }),
-    }));
+    let diff = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                diff: Some(diff),
+                ..
+            } if id == "t2" => Some(diff.clone()),
+            _ => None,
+        })
+        .expect("edit diff present");
+    assert_eq!(diff.path, "/w/src/resolve.rs");
+    assert!(
+        diff.old_text
+            .as_deref()
+            .is_some_and(|t| t.contains(".filter(|p| p.exists())")),
+        "{diff:?}"
+    );
+    assert!(diff.new_text.contains("split_paths"), "{diff:?}");
 
     // Plan → stable todo chip.
     assert!(events.contains(&AgentEvent::ToolCall {
