@@ -1763,7 +1763,6 @@ impl Pickers {
                                             .child(SharedString::from(tag)),
                                     )
                                 })
-                                .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                             },
                         ))
                         .into_any_element()
@@ -1862,7 +1861,6 @@ impl Pickers {
                                 .truncate()
                                 .child(SharedString::from(label)),
                         )
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                     }),
             )
             .into_any_element()
@@ -2026,7 +2024,6 @@ impl Pickers {
                                     )
                                 }),
                         )
-                        .when(is_selected, |el| el.child(popover::menu_check(&theme)))
                         .into_any_element()
                     })
                     .collect()
@@ -2170,12 +2167,9 @@ impl Pickers {
                                     this.pick_reasoning(level, cx);
                                 }))
                                 .child(SharedString::from(reasoning_label(level)));
+                        row = row.child(div().flex_1());
                         if is_default {
                             row = row.child(default_badge(&theme));
-                        }
-                        row = row.child(div().flex_1());
-                        if is_active {
-                            row = row.child(popover::menu_check(&theme));
                         }
                         row
                     }))
@@ -2225,12 +2219,9 @@ impl Pickers {
                                     );
                                 }))
                                 .child(SharedString::from(choice.label.clone()));
+                                row = row.child(div().flex_1());
                                 if is_default {
                                     row = row.child(default_badge(&theme));
-                                }
-                                row = row.child(div().flex_1());
-                                if is_active {
-                                    row = row.child(popover::menu_check(&theme));
                                 }
                                 row
                             }),
