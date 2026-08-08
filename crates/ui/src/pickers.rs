@@ -2137,11 +2137,11 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The traits INSPECTOR: the reasoning ladder plus every advertised
-    /// model option as headed segmented-chip sections, pinned under the
-    /// models pane (formerly menu rows in the shared scroll). Selecting
-    /// keeps the menu open; the active chip carries the wash + ring.
-    /// Mouse-only — arrow keys walk the model list above, never these chips.
+    /// The traits dropdown body (t3code TraitsPicker): the reasoning ladder
+    /// plus every advertised model option as headed sections of menu ROWS —
+    /// label, a "Default" badge on the section's default choice, and the
+    /// trailing check on the selected row. Sections split by hairline
+    /// separators. Selecting keeps the menu open for multi-adjust.
     fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
@@ -2152,118 +2152,120 @@ impl Pickers {
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
 
-        let ladder: AnyElement = if levels.is_empty() {
-            gpui::Empty.into_any_element()
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .child(popover::menu_heading(&theme, "Reasoning"))
-                .child(
-                    div()
-                        .px(px(4.0))
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(4.0))
-                        .children(levels.into_iter().enumerate().map(|(ix, level)| {
-                            let is_active = current == Some(level);
-                            trait_chip(&theme, is_active)
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if !levels.is_empty() {
+            let default_level = default_reasoning(&levels);
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(popover::menu_heading(&theme, "Reasoning"))
+                    .children(levels.into_iter().enumerate().map(|(ix, level)| {
+                        let is_active = current == Some(level);
+                        let is_default = default_level == Some(level);
+                        let mut row =
+                            popover::menu_row(&theme, is_active, format!("trait-reasoning-{ix}"))
                                 .id(("reasoning-row", ix))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_reasoning(level, cx);
                                 }))
-                                .child(SharedString::from(reasoning_label(level)))
-                        })),
-                )
-                .into_any_element()
-        };
+                                .child(SharedString::from(reasoning_label(level)));
+                        if is_default {
+                            row = row.child(default_badge(&theme));
+                        }
+                        row = row.child(div().flex_1());
+                        if is_active {
+                            row = row.child(popover::menu_check(&theme));
+                        }
+                        row
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         let selections = self.explicit_options(cx);
-        let options =
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .children(model.options.iter().enumerate().map(|(opt_ix, option)| {
-                    let selected_choice = selections
-                        .get(&option.id)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        .to_string();
-                    let option_id = option.id.clone();
-                    let default_choice = option.default_choice.clone();
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(popover::menu_heading(&theme, &option.label))
-                        .child(
-                            div()
-                                .px(px(4.0))
-                                .flex()
-                                .flex_row()
-                                .flex_wrap()
-                                .gap(px(4.0))
-                                .children(option.choices.iter().enumerate().map(
-                                    |(choice_ix, choice)| {
-                                        let is_active = selected_choice == choice.id;
-                                        let choice_id = choice.id.clone();
-                                        let option_id = option_id.clone();
-                                        let is_default = choice.id == default_choice;
-                                        trait_chip(&theme, is_active)
-                                            .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.pick_option(
-                                                    option_id.clone(),
-                                                    choice_id.clone(),
-                                                    is_default,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(SharedString::from(choice.label.clone()))
-                                    },
-                                )),
-                        )
-                }));
+        for (opt_ix, option) in model.options.iter().enumerate() {
+            if !sections.is_empty() {
+                sections.push(popover::menu_separator().into_any_element());
+            }
+            let selected_choice = selections
+                .get(&option.id)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&option.default_choice)
+                .to_string();
+            let option_id = option.id.clone();
+            let default_choice = option.default_choice.clone();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(popover::menu_heading(&theme, &option.label))
+                    .children(
+                        option
+                            .choices
+                            .iter()
+                            .enumerate()
+                            .map(|(choice_ix, choice)| {
+                                let is_active = selected_choice == choice.id;
+                                let choice_id = choice.id.clone();
+                                let option_id = option_id.clone();
+                                let is_default = choice.id == default_choice;
+                                let mut row = popover::menu_row(
+                                    &theme,
+                                    is_active,
+                                    format!("trait-choice-{opt_ix}-{choice_ix}"),
+                                )
+                                .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_option(
+                                        option_id.clone(),
+                                        choice_id.clone(),
+                                        is_default,
+                                        cx,
+                                    );
+                                }))
+                                .child(SharedString::from(choice.label.clone()));
+                                if is_default {
+                                    row = row.child(default_badge(&theme));
+                                }
+                                row = row.child(div().flex_1());
+                                if is_active {
+                                    row = row.child(popover::menu_check(&theme));
+                                }
+                                row
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .pb(px(4.0))
-            .child(ladder)
-            .child(options)
+            .pb(px(2.0))
+            .children(sections)
             .into_any_element()
     }
 }
 
-/// A segmented choice chip for the traits inspector (reasoning ladder /
-/// model options): the key-cap voice — every chip carries a faint fill so it
-/// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active chip adds the app-wide wash + glass ring.
-/// The caller adds id/click/label.
-fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
+/// The "Default" pill beside a section's default choice (t3code
+/// `DefaultBadge`: outline, muted wash, 10px semibold).
+fn default_badge(theme: &Theme) -> gpui::Div {
     div()
-        .h(px(24.0))
-        .px(px(10.0))
-        .rounded(px(6.0))
+        .h(px(16.0))
+        .px(px(6.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(theme.border.opacity(0.7))
+        .bg(crate::theme::ink(0.04))
         .flex()
         .flex_row()
         .items_center()
-        .text_size(px(11.5))
-        .cursor_pointer()
-        .when(active, |el| {
-            el.bg(crate::theme::card_selected_bg())
-                .text_color(theme.text)
-        })
-        .when(!active, |el| {
-            el.bg(crate::theme::ink(0.04))
-                .text_color(theme.text_muted.opacity(0.7))
-                .hover(|s| s.bg(theme.element_hover))
-        })
-        .when(active, |el| {
-            el.shadow(crate::theme::card_selected_shadows())
-        })
+        .flex_none()
+        .text_size(px(10.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text_muted)
+        .child(SharedString::from("Default"))
 }
 
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
@@ -2485,7 +2487,7 @@ impl Render for Pickers {
                     .into_any_element();
                 Some((
                     PickerKind::Traits,
-                    self.popover_frame_flush(280.0, content, cx),
+                    self.popover_frame_flush(240.0, content, cx),
                 ))
             }
             None => None,
