@@ -4389,6 +4389,10 @@ impl Composer {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
             s.push_echo(&chat_id, echo);
+            // Working overlay until the host executes the queued command —
+            // without it a remote send flashed Completed (and could ring the
+            // done-chime) in the queue→drain→sync gap.
+            s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
             cx.notify();
         });
 
@@ -4602,6 +4606,7 @@ impl Composer {
                     composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        s.end_pending_send(&err_chat_id, &err_message_id);
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
@@ -5234,6 +5239,26 @@ impl Render for Composer {
                         .child(div().min_w_0().child(message)),
                 )
             });
+
+        // Turn-boundary steering notice: for agents without mid-turn
+        // injection (Grok over ACP today), a "steer" is queued and applies
+        // when the current turn finishes. Without this hint the queue read
+        // as a dropped steer (user report: "my steer didn't apply until
+        // grok already finished").
+        let steer_queues = mode == SendButtonMode::Steer
+            && self.pickers.read(cx).resolved_steering_mode(cx)
+                == Some(comet_proto::SteeringMode::TurnBoundary);
+        let container = container.when(steer_queues, |el| {
+            el.child(
+                div()
+                    .mt(px(6.0))
+                    .px(px(12.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
+            )
+        });
 
         if wizard_active {
             let wizard = self.render_wizard(cx);
