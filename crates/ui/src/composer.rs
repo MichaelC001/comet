@@ -4087,7 +4087,7 @@ impl Composer {
                         }
                     }
                     if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
-                        tracing::debug!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
 
@@ -4163,6 +4163,7 @@ impl Composer {
                     SessionCommandPayload::Run {
                         request: RunRequest {
                             prompt: content.clone(),
+                            harness: resolved.harness,
                             model: resolved.model.clone(),
                             reasoning: resolved.reasoning,
                             model_options: resolved.model_options.clone(),
