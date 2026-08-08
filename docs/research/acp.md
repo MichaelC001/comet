@@ -38,6 +38,13 @@
 - `session/request_permission` → auto-accept the preferred allow option
   (`allow_always` > `allow_once` > first) — parity with claude
   bypassPermissions / codex approvalPolicy never.
+- **Session config options**: ACP has no per-prompt model field; the run's
+  model + reasoning apply through `session/set_config_option` against the
+  session response's advertised `configOptions` (category `model` /
+  `thought_level`, matched to advertised value ids, skipped when current,
+  never fatal). Grok's effort ladder in the picker is Low/Medium/High →
+  `low`/`medium`/`high`; other comet levels degrade down a preference ladder
+  (`config_option_sets`).
 - Steering: `_session/steering` extension when
   `initialize._meta.steering.supported` (org adapters); request carries
   `_meta.steering.idleBehavior: "promptRequired"` so a turn-end race hands the

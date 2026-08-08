@@ -63,6 +63,9 @@ struct AcpAgentSpec {
     install_hint: &'static str,
     models: fn() -> Vec<Model>,
     steering_mode: SteeringMode,
+    /// Effort ladder surfaced in the picker; applied per session via the
+    /// `thought_level` config option (must mirror the registry descriptor).
+    reasoning_levels: &'static [ReasoningLevel],
 }
 
 fn grok_spec() -> AcpAgentSpec {
@@ -93,14 +96,23 @@ fn grok_spec() -> AcpAgentSpec {
                 id: "grok-4.5".into(),
                 label: "Grok 4.5".into(),
                 description: Some("xAI's coding model — 500k context".into()),
-                // Effort rides ACP session config options, not wired yet —
-                // an empty ladder keeps the picker honest.
-                reasoning_levels: Vec::new(),
+                reasoning_levels: vec![
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                ],
                 options: Vec::new(),
             }]
         },
         // No `_session/steering` extension: steers deliver at turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
+        // Grok Build's advertised efforts (default high); applied through the
+        // session's `thought_level` config option.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+        ],
     }
 }
 
@@ -290,7 +302,7 @@ impl Harness for AcpHarness {
         self.spec.steering_mode
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[]
+        self.spec.reasoning_levels
     }
 
     /// Static catalog; an absent binary surfaces as NotInstalled here, like
@@ -419,6 +431,71 @@ fn rotate(id: &mut String) -> (String, String) {
 
 async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEvent) -> bool {
     tx.send(Ok(ev)).await.is_ok()
+}
+
+/// The `session/set_config_option` calls a session response's `configOptions`
+/// warrant for this run: the requested model (category `model`) and effort
+/// (category `thought_level`), matched against the option's advertised value
+/// ids and skipped when already current. Pure so it's testable; unknown
+/// categories and boolean options are left alone.
+fn config_option_sets(
+    session_response: &Value,
+    model: Option<&str>,
+    reasoning: Option<ReasoningLevel>,
+) -> Vec<(String, String)> {
+    let Some(options) = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut sets = Vec::new();
+    for option in options {
+        if option.get("type").and_then(Value::as_str) != Some("select") {
+            continue;
+        }
+        let (Some(config_id), Some(category)) = (
+            option.get("id").and_then(Value::as_str),
+            option.get("category").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let current = option.get("currentValue").and_then(Value::as_str);
+        let available: Vec<&str> = option
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|o| o.get("value").and_then(Value::as_str))
+            .collect();
+        let wanted: Option<&str> = match category {
+            "model" => model.filter(|m| available.contains(m)),
+            "thought_level" => reasoning.and_then(|level| {
+                // Preference ladder per comet level; the first value the
+                // agent actually advertises wins (Grok: low/medium/high).
+                let candidates: &[&str] = match level {
+                    ReasoningLevel::Minimal => &["minimal", "low"],
+                    ReasoningLevel::Low => &["low", "minimal"],
+                    ReasoningLevel::Medium => &["medium"],
+                    ReasoningLevel::High => &["high"],
+                    ReasoningLevel::XHigh => &["xhigh", "x-high", "high"],
+                    ReasoningLevel::Max => &["max", "xhigh", "high"],
+                    ReasoningLevel::Ultra
+                    | ReasoningLevel::Ultracode
+                    | ReasoningLevel::Ultrathink => &["ultra", "max", "high"],
+                };
+                candidates.iter().find(|c| available.contains(*c)).copied()
+            }),
+            _ => None,
+        };
+        if let Some(value) = wanted
+            && current != Some(value)
+        {
+            sets.push((config_id.to_owned(), value.to_owned()));
+        }
+    }
+    sets
 }
 
 /// The events of one `session/update` notification, session-filtered.
@@ -572,11 +649,11 @@ async fn run_session(session: Session) {
         let init_commands = scan_available_commands(&init);
 
         let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
-        let (session_id, loaded) = if let Some(resume) = &request.resume {
+        let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
             match request_draining(&client, &mut incoming, "session/load", load).await {
-                Ok(_) => (resume.clone(), true),
+                Ok(resp) => (resume.clone(), resp),
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
                     tracing::debug!(
@@ -595,7 +672,7 @@ async fn run_session(session: Session) {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
-                        false,
+                        new,
                     )
                 }
             }
@@ -607,7 +684,7 @@ async fn run_session(session: Session) {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
-                false,
+                new,
             )
         };
         if session_id.is_empty() {
@@ -615,7 +692,28 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
-        let _ = loaded;
+        // Apply the run's model + effort through the session's advertised
+        // config options (ACP has no per-prompt model field). Best-effort:
+        // a rejected set is logged, never fatal — the agent's default runs.
+        for (config_id, value) in config_option_sets(
+            &session_response,
+            request.model.as_deref(),
+            request.reasoning,
+        ) {
+            let params = json!({
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": value,
+            });
+            if let Err(e) =
+                request_draining(&client, &mut incoming, "session/set_config_option", params).await
+            {
+                tracing::debug!(
+                    target: "comet_harness::acp",
+                    "session/set_config_option {config_id}={value} rejected (agent default runs): {e}"
+                );
+            }
+        }
         Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
             session_id,
             steer_ext,
@@ -984,6 +1082,76 @@ mod tests {
         assert!(!steering_supported(&json!({
             "_meta": { "steering": { "supported": false } },
         })));
+    }
+
+    #[test]
+    fn config_option_sets_map_model_and_effort() {
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "grok-4-fast",
+                    "options": [
+                        { "value": "grok-4-fast", "name": "Grok 4 Fast" },
+                        { "value": "grok-4.5", "name": "Grok 4.5" },
+                    ],
+                },
+                {
+                    "id": "effort",
+                    "name": "Reasoning effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                    "options": [
+                        { "value": "low", "name": "Low" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "high", "name": "High" },
+                    ],
+                },
+                {
+                    "id": "voice",
+                    "name": "Voice mode",
+                    "category": "other_thing",
+                    "type": "boolean",
+                    "currentValue": false,
+                },
+            ],
+        });
+        // Model needs switching; medium effort differs from current high.
+        assert_eq!(
+            config_option_sets(&response, Some("grok-4.5"), Some(ReasoningLevel::Medium)),
+            vec![
+                ("model".to_owned(), "grok-4.5".to_owned()),
+                ("effort".to_owned(), "medium".to_owned()),
+            ]
+        );
+        // Already-current values and unadvertised models set nothing.
+        assert_eq!(
+            config_option_sets(&response, Some("grok-4-fast"), Some(ReasoningLevel::High)),
+            Vec::<(String, String)>::new()
+        );
+        assert_eq!(
+            config_option_sets(&response, Some("gpt-5.6-sol"), None),
+            Vec::<(String, String)>::new()
+        );
+        // Unknown comet levels degrade down the preference ladder.
+        assert_eq!(
+            config_option_sets(&response, None, Some(ReasoningLevel::Ultra)),
+            Vec::<(String, String)>::new(), // ultra → high == current
+        );
+        assert_eq!(
+            config_option_sets(&response, None, Some(ReasoningLevel::Minimal)),
+            vec![("effort".to_owned(), "low".to_owned())]
+        );
+        // No configOptions advertised → nothing to set.
+        assert_eq!(
+            config_option_sets(&json!({"sessionId": "s"}), Some("grok-4.5"), None),
+            Vec::<(String, String)>::new()
+        );
     }
 
     #[test]

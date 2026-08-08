@@ -48,17 +48,37 @@ if has "$line" '"method":"session/load"'; then
   fi
 elif has "$line" '"method":"session/new"'; then
   has "$line" '"mcpServers":[]' || exit 1
-  emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\"}}"
+  # Advertise config options: model (current differs from the tests' request,
+  # forcing a set) and thought_level (current high).
+  emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
 else
   exit 1
 fi
 
-# ---- first turn ------------------------------------------------------------
+# ---- config option sets (0..n), then the first turn -------------------------
+CONFIG_SETS=""
 read -r promptline || exit 1
+while has "$promptline" '"method":"session/set_config_option"'; do
+  emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
+  CONFIG_SETS="$CONFIG_SETS $promptline"
+  read -r promptline || exit 1
+done
 has "$promptline" '"method":"session/prompt"' || exit 1
 pid=$(rid "$promptline")
 
 case "$promptline" in
+
+*scenario:config*)
+  # The tests' request carries model grok-4.5 + medium effort; both differ
+  # from the advertised currents, so both sets must have arrived.
+  if has "$CONFIG_SETS" '"configId":"model"' && has "$CONFIG_SETS" '"value":"grok-4.5"' \
+    && has "$CONFIG_SETS" '"configId":"effort"' && has "$CONFIG_SETS" '"value":"medium"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"configured"}}'
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
 
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'

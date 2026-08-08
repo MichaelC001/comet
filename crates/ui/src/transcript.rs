@@ -2342,8 +2342,11 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// One tool chip row: a guide rail on the left (continuous across stacked
 /// chips — the rail spans the row's full height) threading the chips to their
 /// group toggle, then the chip card (comet tool-chip.tsx).
-/// The expanded output/diff block under a chip: quiet mono lines, additions
-/// and deletions tinted like the changes pane, meta rows muted.
+/// The expanded output/diff block under a chip: a quiet mono card whose
+/// add/del rows carry a full-width wash in the changes-pane hues, so a diff
+/// reads at a glance (GitHub-style) instead of as colored plain text. Rows own
+/// the horizontal padding — the container has none — so washes reach the card
+/// edges; heights stay analytic ([`DETAIL_LINE_HEIGHT`] per row).
 fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
     div()
         // Indent past the guide rail so the block hangs under the chip card.
@@ -2352,8 +2355,7 @@ fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
         .rounded(px(9.0))
         .border_1()
         .border_color(crate::theme::hairline(0.07))
-        .bg(crate::theme::ink(0.03))
-        .px(px(8.0))
+        .bg(crate::theme::ink(0.04))
         .py(px(6.0))
         .flex()
         .flex_col()
@@ -2361,19 +2363,24 @@ fn detail_block(lines: &Arc<Vec<DetailLine>>, theme: &Theme) -> AnyElement {
         .font_family(theme.font_mono.clone())
         .text_size(px(11.0))
         .children(lines.iter().map(|line| {
-            let color = match line.kind {
-                DetailKind::Add => theme.diff_add,
-                DetailKind::Del => theme.diff_del,
-                DetailKind::Meta => theme.text_muted.opacity(0.7),
-                DetailKind::Context => theme.text.opacity(0.75),
+            let (color, wash) = match line.kind {
+                DetailKind::Add => (theme.diff_add, Some(theme.diff_add.opacity(0.11))),
+                DetailKind::Del => (theme.diff_del, Some(theme.diff_del.opacity(0.11))),
+                DetailKind::Meta => (theme.text_muted.opacity(0.6), None),
+                DetailKind::Context => (theme.text.opacity(0.82), None),
             };
-            div()
+            let mut row = div()
                 .h(px(DETAIL_LINE_HEIGHT))
                 .w_full()
                 .min_w_0()
-                .truncate()
-                .text_color(color)
-                .child(line.text.clone())
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .text_color(color);
+            if let Some(wash) = wash {
+                row = row.bg(wash);
+            }
+            row.child(div().w_full().min_w_0().truncate().child(line.text.clone()))
         }))
         .into_any_element()
 }
@@ -2455,13 +2462,20 @@ fn tool_chip(tool: &ToolItem, expandable: bool, detail_open: bool, theme: &Theme
                         .child(SharedString::from(detail)),
                 )
                 .when(expandable, |card| {
-                    // Output/diff affordance: a quiet chevron that flips while
-                    // the detail block is open (clicking the chip toggles it).
+                    // Output/diff affordance: a chevron tile matching the
+                    // group header's, flipped while the detail block is open
+                    // (clicking the chip toggles it).
                     card.child(
                         div()
+                            .size(px(18.0))
                             .flex_none()
+                            .rounded(px(5.0))
+                            .bg(crate::theme::ink(0.06))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .text_size(px(10.0))
-                            .text_color(theme.text_muted.opacity(0.7))
+                            .text_color(theme.text_muted.opacity(0.8))
                             .child(SharedString::from(if detail_open { "▾" } else { "▸" })),
                     )
                 }),

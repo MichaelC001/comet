@@ -216,15 +216,19 @@ pub fn default_registry() -> HarnessRegistry {
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
-    // steers deliver at turn boundaries; the effort ladder is empty until
-    // ACP session config options are wired.
+    // steers deliver at turn boundaries; the effort ladder applies per
+    // session via the `thought_level` config option.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Grok,
             name: "Grok".into(),
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: Vec::new(),
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ],
         },
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
     );
@@ -291,7 +295,14 @@ mod tests {
         assert_eq!(grok.id(), HarnessId::Grok);
         assert_eq!(grok.display_name(), "Grok");
         assert_eq!(grok.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(grok.reasoning_levels().is_empty());
+        assert_eq!(
+            grok.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High
+            ]
+        );
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`

@@ -194,6 +194,23 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
 }
 
 #[tokio::test]
+async fn config_options_apply_requested_model_and_effort() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:config");
+    req.reasoning = Some(comet_proto::ReasoningLevel::Medium);
+    let events = run_to_end(&harness(), req, controls).await;
+    // The fixture answers refusal unless BOTH set_config_option calls
+    // (model grok-4.5, effort medium) arrived before the prompt.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "configured".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
@@ -432,5 +449,12 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
     assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
-    assert!(harness.reasoning_levels().is_empty());
+    assert_eq!(
+        harness.reasoning_levels(),
+        &[
+            comet_proto::ReasoningLevel::Low,
+            comet_proto::ReasoningLevel::Medium,
+            comet_proto::ReasoningLevel::High,
+        ]
+    );
 }
