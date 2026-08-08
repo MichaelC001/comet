@@ -225,8 +225,11 @@ pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 /// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
 pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
 
-/// Vertical chrome of a detail card: py(6)×2 + border + bottom margin.
-const DETAIL_CARD_CHROME: f32 = 18.0;
+/// Vertical padding of an output detail body (py(6) × 2).
+const OUTPUT_BODY_PAD: f32 = 12.0;
+
+/// The hairline between an expanded chip's header row and its detail body.
+const DETAIL_SEPARATOR: f32 = 1.0;
 
 /// Build a tool part's expandable detail. A diff wins over raw output (it is
 /// the more structured record of the same action).
@@ -867,19 +870,22 @@ pub fn chips_height(count: usize) -> f32 {
     CHIPS_TOP_PAD + count as f32 * CHIP_HEIGHT + (count as f32 - 1.0) * CHIP_GAP
 }
 
-/// Analytic height of one open detail block — output blocks by line count,
-/// diff blocks via the changes pane's own [`crate::changes::body_height`].
+/// Analytic height an open detail adds to its chip's card (separator + body)
+/// — output blocks by line count, diff blocks via the changes pane's own
+/// [`crate::changes::body_height`]. The chip's own [`CHIP_HEIGHT`] is already
+/// counted by [`chips_height`].
 pub fn detail_height(detail: &ToolDetail) -> f32 {
-    match detail {
+    let body = match detail {
         ToolDetail::Output {
             lines,
             truncated_by,
         } => {
             let rows = lines.len() + usize::from(*truncated_by > 0);
-            rows as f32 * OUTPUT_LINE_HEIGHT + DETAIL_CARD_CHROME
+            rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
         }
-        ToolDetail::Diff { file, .. } => crate::changes::body_height(file) + DETAIL_CARD_CHROME,
-    }
+        ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+    };
+    DETAIL_SEPARATOR + body
 }
 
 // ---------------------------------------------------------------------------
@@ -2126,26 +2132,63 @@ impl Transcript {
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
                 let Some(detail) = tool.detail.clone() else {
-                    return tool_chip(tool, false, false, theme);
+                    return tool_chip(tool, theme);
                 };
-                let detail_open = detail_opens[ix];
-                let chip = tool_chip(tool, true, detail_open, theme);
+                let open = detail_opens[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
-                let mut column = div().flex().flex_col().w_full().flex_none().child(
-                    div()
-                        .id(key.clone())
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let open = this.tool_details.entry(key.clone()).or_insert(false);
-                            *open = !*open;
-                            cx.notify();
-                        }))
-                        .child(chip),
-                );
-                if detail_open {
-                    column = column.child(detail_block(&detail, theme));
+                // Expandable chip: ONE card whose header row is the chip and
+                // whose body is the detail — not a floating card below it.
+                // The guide rail stretches with the row, so an open detail
+                // never breaks the rail.
+                let mut card = div()
+                    .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
+                    .ml(px(12.0))
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(9.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.07))
+                    .bg(crate::theme::ink(0.03))
+                    .child(
+                        div()
+                            .id(key.clone())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let open = this.tool_details.entry(key.clone()).or_insert(false);
+                                *open = !*open;
+                                cx.notify();
+                            }))
+                            .child(chip_header(tool, open, theme)),
+                    );
+                if open {
+                    card = card
+                        .child(
+                            div()
+                                .h(px(DETAIL_SEPARATOR))
+                                .flex_none()
+                                .bg(crate::theme::hairline(0.06)),
+                        )
+                        .child(detail_body(&detail, theme));
                 }
-                column.into_any_element()
+                div()
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    // Guide rail: no fixed height — stretches to the card,
+                    // detail included.
+                    .child(
+                        div()
+                            .ml(px(12.0))
+                            .w(px(1.0))
+                            .flex_none()
+                            .bg(crate::theme::ink(0.08)),
+                    )
+                    .child(card)
+                    .into_any_element()
             }));
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
@@ -2403,27 +2446,16 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
     }
 }
 
-/// The expanded block under a chip. Diffs render through the changes pane's
-/// section body — the real component, with hunk headers, dual line-number
-/// gutters, accent bars, row washes, and syntax runs — so an inline tool diff
-/// is indistinguishable from the checkout diff sidebar. Output renders as a
-/// code block: verbatim mono lines, indentation intact, counted-tail
-/// truncation. Both sit in the same quiet card hanging under the chip.
-fn detail_block(detail: &ToolDetail, theme: &Theme) -> AnyElement {
-    // Indent past the guide rail so the block hangs under the chip card.
-    let card = div()
-        .ml(px(25.0))
-        .mb(px(4.0))
-        .rounded(px(9.0))
-        .border_1()
-        .border_color(crate::theme::hairline(0.07))
-        .bg(crate::theme::ink(0.04))
-        .py(px(6.0))
-        .flex()
-        .flex_col()
-        .overflow_hidden();
+/// The body of an expanded chip card, under the header's separator. Diffs
+/// render through the changes pane's section body — the real component, with
+/// hunk headers, dual line-number gutters, accent bars, row washes, and
+/// syntax runs — so an inline tool diff is indistinguishable from the
+/// checkout diff sidebar. Output renders as a code block: verbatim mono
+/// lines, indentation intact, counted-tail truncation.
+fn detail_body(detail: &ToolDetail, theme: &Theme) -> AnyElement {
+    let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
     match detail {
-        ToolDetail::Diff { file, highlight } => card
+        ToolDetail::Diff { file, highlight } => body
             .child(crate::changes::render_file_body(
                 file,
                 highlight.clone(),
@@ -2433,7 +2465,8 @@ fn detail_block(detail: &ToolDetail, theme: &Theme) -> AnyElement {
         ToolDetail::Output {
             lines,
             truncated_by,
-        } => card
+        } => body
+            .py(px(6.0))
             .font_family(theme.font_mono.clone())
             .text_size(px(11.5))
             .children(lines.iter().map(|line| {
@@ -2463,13 +2496,88 @@ fn detail_block(detail: &ToolDetail, theme: &Theme) -> AnyElement {
     }
 }
 
-fn tool_chip(tool: &ToolItem, expandable: bool, detail_open: bool, theme: &Theme) -> AnyElement {
+/// The chip's content row: icon tile + label + detail line (+ chevron tile
+/// when the chip expands). Shared between the plain chip and the header of an
+/// expandable chip card.
+fn chip_header_row(tool: &ToolItem, chevron: Option<bool>, theme: &Theme) -> gpui::Div {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
         theme.danger
     } else {
         theme.text_muted
     };
+    div()
+        .h(px(CHIP_CARD_HEIGHT))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .text_size(px(12.0))
+        .child(
+            // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
+            // icon size-3).
+            div()
+                .size(px(18.0))
+                .flex_none()
+                .rounded(px(5.0))
+                .bg(crate::theme::ink(0.08))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::icons::icon(tool_icon_path(&tool.call))
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tint)
+                .child(SharedString::from(label)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(if tool.is_error {
+                    theme.danger
+                } else {
+                    theme.text.opacity(0.85)
+                })
+                .child(SharedString::from(detail)),
+        )
+        .when_some(chevron, |row, open| {
+            // Output/diff affordance: a chevron tile matching the group
+            // header's, flipped while the detail body is open.
+            row.child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+            )
+        })
+}
+
+/// The header row of an expandable chip card.
+fn chip_header(tool: &ToolItem, open: bool, theme: &Theme) -> gpui::Div {
+    chip_header_row(tool, Some(open), theme)
+}
+
+/// A plain (non-expandable) chip: guide rail + bordered card.
+fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
     div()
         .h(px(CHIP_HEIGHT))
         .w_full()
@@ -2492,71 +2600,12 @@ fn tool_chip(tool: &ToolItem, expandable: bool, detail_open: bool, theme: &Theme
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
                 .border_color(crate::theme::hairline(0.07))
                 .bg(crate::theme::ink(0.03))
-                .px(px(8.0))
-                .text_size(px(12.0))
-                .child(
-                    // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
-                    // icon size-3).
-                    div()
-                        .size(px(18.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .bg(crate::theme::ink(0.08))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(tool_icon_path(&tool.call))
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(tint)
-                        .child(SharedString::from(label)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(if tool.is_error {
-                            theme.danger
-                        } else {
-                            theme.text.opacity(0.85)
-                        })
-                        .child(SharedString::from(detail)),
-                )
-                .when(expandable, |card| {
-                    // Output/diff affordance: a chevron tile matching the
-                    // group header's, flipped while the detail block is open
-                    // (clicking the chip toggles it).
-                    card.child(
-                        div()
-                            .size(px(18.0))
-                            .flex_none()
-                            .rounded(px(5.0))
-                            .bg(crate::theme::ink(0.06))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted.opacity(0.8))
-                            .child(SharedString::from(if detail_open { "▾" } else { "▸" })),
-                    )
-                }),
+                .child(chip_header_row(tool, None, theme)),
         )
         .into_any_element()
 }
