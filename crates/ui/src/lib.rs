@@ -19,6 +19,7 @@ pub mod changes;
 pub mod composer;
 pub mod edge_fade;
 pub mod frost;
+pub mod harness_prefs;
 pub mod icons;
 pub mod loaders;
 pub mod markdown;
@@ -140,11 +141,9 @@ pub fn run_app(config: UiConfig) {
         // final one on the very first frame, or the window flashes the wrong
         // palette while settings load.
         let data_dir = config.boot().data_dir.clone();
-        appearance::init(
-            settings::UiSettings::load(&data_dir).appearance,
-            data_dir,
-            cx,
-        );
+        let boot_settings = settings::UiSettings::load(&data_dir);
+        appearance::init(boot_settings.appearance, data_dir.clone(), cx);
+        harness_prefs::init(boot_settings.enabled_harnesses, data_dir, cx);
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);

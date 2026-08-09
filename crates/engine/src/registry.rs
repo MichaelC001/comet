@@ -19,6 +19,15 @@ pub struct HarnessDescriptor {
     pub supports_steering: bool,
     pub steering_mode: SteeringMode,
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// Whether the agent's CLI is present on the listing device (the settings
+    /// enable-gate). Defaults true so catalogs from engines predating the
+    /// field never read as uninstallable.
+    #[serde(default = "default_installed")]
+    pub installed: bool,
+}
+
+fn default_installed() -> bool {
+    true
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -28,15 +37,20 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         supports_steering: harness.supports_steering(),
         steering_mode: harness.steering_mode(),
         reasoning_levels: harness.reasoning_levels().to_vec(),
+        installed: harness.installed(),
     }
 }
 
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
+type InstalledProbe = Box<dyn Fn() -> bool + Send + Sync>;
 
 enum Slot {
     Ready(Arc<dyn Harness>),
     Lazy {
         descriptor: HarnessDescriptor,
+        /// Re-run on every `descriptors()` call — a CLI installed mid-session
+        /// shows up on the next settings/picker open, no restart needed.
+        installed: InstalledProbe,
         factory: Factory,
     },
 }
@@ -75,8 +89,15 @@ impl HarnessRegistry {
         }
     }
 
-    /// Register a slot resolved on first `resolve` (the factory result is cached).
-    pub fn register_lazy(&self, descriptor: HarnessDescriptor, factory: Factory) {
+    /// Register a slot resolved on first `resolve` (the factory result is
+    /// cached). `installed` is the CLI-presence probe run per `descriptors()`
+    /// call; it must never spawn.
+    pub fn register_lazy(
+        &self,
+        descriptor: HarnessDescriptor,
+        installed: InstalledProbe,
+        factory: Factory,
+    ) {
         let id = descriptor.id;
         if self
             .slots()
@@ -84,6 +105,7 @@ impl HarnessRegistry {
                 id,
                 Slot::Lazy {
                     descriptor,
+                    installed,
                     factory,
                 },
             )
@@ -113,7 +135,14 @@ impl HarnessRegistry {
             .iter()
             .filter_map(|id| match slots.get(id) {
                 Some(Slot::Ready(harness)) => Some(describe(harness.as_ref())),
-                Some(Slot::Lazy { descriptor, .. }) => Some(descriptor.clone()),
+                Some(Slot::Lazy {
+                    descriptor,
+                    installed,
+                    ..
+                }) => Some(HarnessDescriptor {
+                    installed: installed(),
+                    ..descriptor.clone()
+                }),
                 None => None,
             })
             .collect()
@@ -187,7 +216,9 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max,
             ],
+            installed: true,
         },
+        Box::new(|| comet_harness::AcpHarness::claude().installed()),
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
@@ -211,7 +242,9 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
                 ReasoningLevel::Ultra,
             ],
+            installed: true,
         },
+        Box::new(|| comet_harness::AcpHarness::codex().installed()),
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
@@ -229,7 +262,9 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
             ],
+            installed: true,
         },
+        Box::new(|| comet_harness::AcpHarness::grok().installed()),
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
     );
     // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
@@ -243,7 +278,9 @@ pub fn default_registry() -> HarnessRegistry {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
+            installed: true,
         },
+        Box::new(|| comet_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
@@ -263,7 +300,9 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max,
             ],
+            installed: true,
         },
+        Box::new(|| comet_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
     registry
@@ -286,7 +325,9 @@ mod tests {
                 supports_steering: true,
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
+                installed: true,
             },
+            Box::new(|| false),
             Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Err(HarnessError::NotInstalled("nope".into()))
@@ -295,6 +336,8 @@ mod tests {
         let listed = registry.descriptors();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "Lazy Mock");
+        // The listing runs the probe, not the stored placeholder.
+        assert!(!listed[0].installed);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -360,6 +403,21 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
+    }
+
+    /// Catalogs serialized by engines that predate the `installed` field must
+    /// keep deserializing — and read as installed, never as blocked.
+    #[test]
+    fn descriptor_without_installed_parses_as_installed() {
+        let json = r#"{
+            "id": "claude-code",
+            "name": "Claude Code",
+            "supportsSteering": true,
+            "steeringMode": "step-boundary",
+            "reasoningLevels": []
+        }"#;
+        let descriptor: HarnessDescriptor = serde_json::from_str(json).unwrap();
+        assert!(descriptor.installed);
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`
