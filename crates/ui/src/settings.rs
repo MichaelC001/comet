@@ -76,21 +76,6 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
-    /// Harnesses the user has enabled (Settings → Agents). `None` — the file
-    /// predates the setting or the user never touched it — means the default
-    /// set ([`default_enabled_harnesses`]). Device-local, like every other
-    /// preference here: CLI installs are per-device too.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enabled_harnesses: Option<Vec<comet_proto::HarnessId>>,
-}
-
-/// The out-of-the-box harness set: Claude Code and Codex only; the rest are
-/// opt-in from Settings → Agents.
-pub fn default_enabled_harnesses() -> Vec<comet_proto::HarnessId> {
-    vec![
-        comet_proto::HarnessId::ClaudeCode,
-        comet_proto::HarnessId::Codex,
-    ]
 }
 
 impl Default for UiSettings {
@@ -109,7 +94,6 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
-            enabled_harnesses: None,
         }
     }
 }
@@ -369,29 +353,9 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
-            enabled_harnesses: Some(vec![
-                comet_proto::HarnessId::ClaudeCode,
-                comet_proto::HarnessId::Grok,
-            ]),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
-    }
-
-    /// Files that predate the harness setting load as "default set", and the
-    /// default set is exactly Claude Code + Codex.
-    #[test]
-    fn harness_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth": 300}"#).unwrap();
-        assert_eq!(UiSettings::load(dir.path()).enabled_harnesses, None);
-        assert_eq!(
-            default_enabled_harnesses(),
-            vec![
-                comet_proto::HarnessId::ClaudeCode,
-                comet_proto::HarnessId::Codex
-            ]
-        );
     }
 
     /// A settings file written before light mode existed has no `appearance`

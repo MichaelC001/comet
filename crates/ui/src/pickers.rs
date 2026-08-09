@@ -449,12 +449,12 @@ impl Pickers {
             return Some(config.harness);
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
-        // when the loaded catalog still offers it (and the user hasn't
+        // when the loaded catalog still offers it (the device may have
         // disabled it in Settings → Agents since).
         if let Some(harness) = self.defaults.harness {
             let offered = match self.harnesses.ready() {
-                Some(list) => offered_harnesses(list, cx).iter().any(|d| d.id == harness),
-                None => crate::harness_prefs::is_enabled(harness, cx), // catalog not loaded yet
+                Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
+                None => true, // catalog not loaded yet — trust the memory
             };
             if offered {
                 return Some(harness);
@@ -466,7 +466,7 @@ impl Pickers {
         // model (it stays available under `COMET_HARNESS=mock`).
         self.harnesses
             .ready()
-            .and_then(|list| offered_harnesses(list, cx).first().map(|d| d.id))
+            .and_then(|list| offered_harnesses(list).first().map(|d| d.id))
     }
 
     /// Effective model id: the draft pick, the selected chat's config, or (on
@@ -682,7 +682,7 @@ impl Pickers {
     /// its slot state, so re-running this every catalog load/render is free.
     fn prefetch_models(&mut self, cx: &mut Context<Self>) {
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
-            Some(list) => offered_harnesses(list, cx).iter().map(|d| d.id).collect(),
+            Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
             None => Vec::new(),
         };
         // The committed chat's harness may be outside the offered set (e.g.
@@ -1944,7 +1944,7 @@ impl Pickers {
                 )
             }
             Loadable::Ready(list) => {
-                let mut descriptors: Vec<HarnessDescriptor> = offered_harnesses(list, cx);
+                let mut descriptors: Vec<HarnessDescriptor> = offered_harnesses(list);
                 // The committed harness always gets its rail tab, even when
                 // it's the (normally hidden) mock harness of a dev session.
                 if let Some(effective) = effective
@@ -2348,27 +2348,22 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 }
 
 /// What the composer actually offers: [`visible_harnesses`] narrowed to the
-/// user's enabled set (Settings → Agents). The dev-rig mock opt-in survives
-/// the filter, and an enabled set that matches nothing in the catalog (a
-/// remote device with a different registry) falls back to everything visible
-/// rather than an empty rail.
-pub fn offered_harnesses(list: &[HarnessDescriptor], cx: &App) -> Vec<HarnessDescriptor> {
-    offered_harnesses_impl(
-        list,
-        mock_harness_enabled(),
-        &crate::harness_prefs::enabled(cx),
-    )
+/// catalog device's enabled set (Settings → Agents — per-device state, so a
+/// space on another device follows THAT device's toggles). The dev-rig mock
+/// opt-in survives the filter, and a catalog where nothing is enabled (or
+/// that predates the flag entirely and defaults empty) falls back to
+/// everything visible rather than an empty rail.
+pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
+    offered_harnesses_impl(list, mock_harness_enabled())
 }
 
-fn offered_harnesses_impl(
-    list: &[HarnessDescriptor],
-    allow_mock: bool,
-    enabled: &[HarnessId],
-) -> Vec<HarnessDescriptor> {
+fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
     let visible = visible_harnesses_impl(list, allow_mock);
     let offered: Vec<HarnessDescriptor> = visible
         .iter()
-        .filter(|d| enabled.contains(&d.id) || (allow_mock && d.id == HarnessId::Mock))
+        .filter(|d| {
+            comet_engine::registry::descriptor_enabled(d) || (allow_mock && d.id == HarnessId::Mock)
+        })
         .cloned()
         .collect();
     if offered.is_empty() { visible } else { offered }
@@ -2776,6 +2771,7 @@ mod tests {
             steering_mode: comet_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
             installed: true,
+            enabled: None,
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
@@ -2793,50 +2789,47 @@ mod tests {
     }
 
     #[test]
-    fn offered_harnesses_follow_the_enabled_set() {
-        let descriptor = |id: HarnessId, name: &str| HarnessDescriptor {
+    fn offered_harnesses_follow_the_catalog_enabled_flags() {
+        let descriptor = |id: HarnessId, name: &str, enabled: Option<bool>| HarnessDescriptor {
             id,
             name: name.into(),
             supports_steering: true,
             steering_mode: comet_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
             installed: true,
+            enabled,
         };
-        let catalog = vec![
-            descriptor(HarnessId::Mock, "Mock"),
-            descriptor(HarnessId::ClaudeCode, "Claude Code"),
-            descriptor(HarnessId::Codex, "Codex"),
-            descriptor(HarnessId::Grok, "Grok"),
-        ];
-        // Default set: Claude Code + Codex only.
-        let offered = offered_harnesses_impl(
-            &catalog,
-            false,
-            &crate::settings::default_enabled_harnesses(),
-        );
+        let catalog = |claude: Option<bool>, codex: Option<bool>, grok: Option<bool>| {
+            vec![
+                descriptor(HarnessId::Mock, "Mock", Some(false)),
+                descriptor(HarnessId::ClaudeCode, "Claude Code", claude),
+                descriptor(HarnessId::Codex, "Codex", codex),
+                descriptor(HarnessId::Grok, "Grok", grok),
+            ]
+        };
+        // A catalog from an engine predating the flag (all None) falls back
+        // to default-set membership: Claude Code + Codex only.
+        let offered = offered_harnesses_impl(&catalog(None, None, None), false);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
             vec![HarnessId::ClaudeCode, HarnessId::Codex]
         );
-        // Grok enabled joins the rail; catalog order is preserved.
-        let offered = offered_harnesses_impl(
-            &catalog,
-            false,
-            &[HarnessId::ClaudeCode, HarnessId::Grok],
-        );
+        // The device's flags win: Grok on, Codex off; catalog order holds.
+        let offered =
+            offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
             vec![HarnessId::ClaudeCode, HarnessId::Grok]
         );
         // The dev-rig mock opt-in survives the enabled filter.
-        let offered = offered_harnesses_impl(&catalog, true, &[HarnessId::ClaudeCode]);
+        let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), None), true);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
             vec![HarnessId::Mock, HarnessId::ClaudeCode]
         );
-        // An enabled set matching nothing in the catalog falls back to the
-        // visible list instead of an empty rail.
-        let offered = offered_harnesses_impl(&catalog, false, &[HarnessId::Cursor]);
+        // Nothing enabled falls back to the visible list, not an empty rail.
+        let offered =
+            offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
         assert_eq!(offered.len(), 3);
     }
 }

@@ -1,20 +1,30 @@
 //! Settings → Agents: enable/disable harnesses (the t3code models-page
 //! arrangement — one card row per agent with a trailing toggle).
 //!
+//! The state is PER-DEVICE and lives on the engine (`harness-prefs.json` in
+//! its data dir): CLI installs are per-device, so enablement is too. The
+//! page-header device switcher (the Accounts pattern) retargets both the
+//! `ListHarnesses` probe and the `SetHarnessEnabled` writes at any registered
+//! device over the relay-forwarded RPCs.
+//!
 //! Only Claude Code and Codex ship enabled; the rest are opt-in. A harness
-//! whose CLI is missing on this device renders dimmed with an install hint
-//! and its toggle inert — enabling an agent that can't run would only
-//! manufacture NotInstalled errors at send time. The installed flag comes
-//! from `ListHarnesses` (a filesystem probe engine-side, never a spawn), so
-//! reopening the page after installing a CLI picks it up.
+//! whose CLI is missing on the target device renders dimmed with an install
+//! hint and its toggle inert — enabling an agent that can't run would only
+//! manufacture NotInstalled errors at send time. The engine enforces the same
+//! gate (plus "can't disable the last enabled harness") where the state
+//! lives, so a raced or stale toggle self-corrects from the RPC reply.
 
-use gpui::{Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*, px};
+use std::time::Duration;
 
-use comet_engine::registry::HarnessDescriptor;
+use gpui::{
+    AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
+    px,
+};
+
+use comet_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use comet_proto::HarnessId;
 use comet_rpc::methods;
 
-use crate::harness_prefs;
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
@@ -51,7 +61,16 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
 pub struct HarnessesPage {
     state: Entity<AppState>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
+    /// Which device's harnesses are shown/edited; `None` = this device (no
+    /// passthrough). Retargeted by the page-header device switcher.
+    target_device: Option<String>,
+    device_menu_open: bool,
+    /// Outside-click dismissal vs trigger-click race (the Accounts pattern).
+    device_menu_dismissed_at: Option<std::time::Instant>,
+    /// Last refused/failed toggle (engine guards), shown in the error strip.
+    error: Option<String>,
     load_task: Option<Task<()>>,
+    toggle_task: Option<Task<()>>,
 }
 
 impl HarnessesPage {
@@ -59,24 +78,50 @@ impl HarnessesPage {
         let mut page = Self {
             state,
             harnesses: Loadable::Idle,
+            target_device: None,
+            device_menu_open: false,
+            device_menu_dismissed_at: None,
+            error: None,
             load_task: None,
+            toggle_task: None,
         };
         page.load(cx);
         page
     }
 
-    /// `ListHarnesses` against the LOCAL device — the toggles gate what this
-    /// device's composer offers, and CLI installs are per-device.
+    /// Params with the `targetDeviceId` passthrough merged in.
+    fn with_target(&self, mut value: serde_json::Value) -> serde_json::Value {
+        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(target));
+        }
+        value
+    }
+
+    /// Retarget the page at another device: a different device is a different
+    /// install/enablement world, so drop the rows and reload through it.
+    fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        self.device_menu_open = false;
+        if self.target_device == target {
+            cx.notify();
+            return;
+        }
+        self.target_device = target;
+        self.error = None;
+        self.harnesses = Loadable::Idle;
+        self.load(cx);
+        cx.notify();
+    }
+
+    /// `ListHarnesses` against the target device (installed probe + enabled
+    /// set both come from where the CLIs actually live).
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let params = self.with_target(serde_json::json!({}));
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::json!({}))
-                .await;
+            let result = engine.client().call(methods::LIST_HARNESSES, params).await;
             this.update(cx, |page, cx| {
                 page.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
@@ -91,23 +136,203 @@ impl HarnessesPage {
         }));
     }
 
+    /// Flip one harness on the target device. The reply carries the device's
+    /// fresh catalog, so the rows repaint from the authoritative state in one
+    /// round trip; refusals (engine guards) land in the error strip.
+    fn toggle(&mut self, harness: HarnessId, enabled: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.with_target(serde_json::json!({
+            "harness": harness,
+            "enabled": enabled,
+        }));
+        self.error = None;
+        self.toggle_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::SET_HARNESS_ENABLED, params)
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(value) => {
+                        if let Ok(list) = serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
+                            page.harnesses = Loadable::Ready(list);
+                        }
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The page-header device switcher (the Accounts pattern): platform glyph
+    /// · name · presence dot · sort glyph, opening a dropdown of every
+    /// registered device.
+    fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::icons::{self, icon};
+        let (mut devices, local_id) = {
+            let s = self.state.read(cx);
+            (s.devices.clone(), s.local_device_id.clone())
+        };
+        devices.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let effective = self.target_device.clone().or_else(|| local_id.clone());
+        let selected = devices
+            .iter()
+            .find(|d| Some(d.id.as_str()) == effective.as_deref())
+            .cloned();
+        let platform_glyph = |platform: &str| match platform {
+            "macos" | "darwin" => icons::LAPTOP,
+            "ios" | "android" => icons::SMARTPHONE,
+            _ => icons::MONITOR,
+        };
+        let trigger_glyph = platform_glyph(
+            selected
+                .as_ref()
+                .map(|d| d.platform.as_str())
+                .unwrap_or("macos"),
+        );
+        let trigger_label: SharedString = selected
+            .as_ref()
+            .map(|d| d.name.clone().into())
+            .unwrap_or_else(|| SharedString::from("This device"));
+        let emerald = theme.success;
+        let open = self.device_menu_open;
+
+        let mut trigger =
+            div()
+                .id("harnesses-device-switcher")
+                .flex_none()
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .bg(if open {
+                    crate::theme::ink(0.06)
+                } else {
+                    gpui::transparent_black()
+                })
+                .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let just_dismissed = this
+                        .device_menu_dismissed_at
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
+                    this.device_menu_dismissed_at = None;
+                    cx.notify();
+                }))
+                .child(
+                    icon(trigger_glyph)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(trigger_label),
+                )
+                .child(div().size(px(6.0)).rounded_full().flex_none().bg(
+                    if effective == local_id {
+                        emerald
+                    } else {
+                        crate::theme::ink(0.2)
+                    },
+                ))
+                .child(
+                    icon(icons::SORT_VERTICAL)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
+                );
+
+        if open {
+            let menu = popover::popover_card(theme)
+                .w(px(220.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.device_menu_open = false;
+                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
+                    cx.notify();
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(popover::menu_heading(theme, "Devices"))
+                .children(devices.into_iter().enumerate().map(|(ix, d)| {
+                    let is_active = Some(d.id.as_str()) == effective.as_deref();
+                    let is_local = local_id.as_deref() == Some(d.id.as_str());
+                    let glyph = platform_glyph(&d.platform);
+                    let name: SharedString = d.name.clone().into();
+                    let pick_local = is_local;
+                    let pick_id = d.id.clone();
+                    popover::menu_row(theme, is_active, format!("harnesses-device-row-{ix}"))
+                        .id(("harnesses-device-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Local device = no passthrough (calls stay direct).
+                            let target = (!pick_local).then(|| pick_id.clone());
+                            this.set_target_device(target, cx);
+                        }))
+                        .child(
+                            icon(glyph)
+                                .size(px(16.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .when(is_local, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_muted.opacity(0.35))
+                                    .child(SharedString::from("You")),
+                            )
+                        })
+                        .child(div().size(px(6.0)).rounded_full().flex_none().bg(
+                            if is_local {
+                                emerald
+                            } else {
+                                crate::theme::ink(0.2)
+                            },
+                        ))
+                }))
+                .into_any_element();
+            trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu));
+        }
+        trigger.into_any_element()
+    }
+
     fn rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = Theme::of(cx).clone();
         let Loadable::Ready(list) = &self.harnesses else {
             return Vec::new();
         };
-        let enabled_set = harness_prefs::enabled(cx);
         let descriptors = visible_harnesses(list);
+        let enabled_count = descriptors.iter().filter(|d| descriptor_enabled(d)).count();
         descriptors
             .into_iter()
             .enumerate()
             .map(|(ix, descriptor)| {
                 let harness = descriptor.id;
                 let installed = descriptor.installed;
-                let enabled = enabled_set.contains(&harness);
+                let enabled = descriptor_enabled(&descriptor);
                 // The one enabled harness left can't be switched off — the
-                // composer needs something to run.
-                let last_enabled = enabled && enabled_set.len() == 1;
+                // composer needs something to run (mirrors the engine guard).
+                let last_enabled = enabled && enabled_count == 1;
                 let interactive = installed && !last_enabled;
                 let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
                 let mut meta: Vec<gpui::AnyElement> = vec![
@@ -161,9 +386,8 @@ impl HarnessesPage {
                             .id(("harness-toggle", ix))
                             .when(interactive, |el| {
                                 el.cursor_pointer().on_click(cx.listener(
-                                    move |_, _, _, cx| {
-                                        harness_prefs::set_enabled(harness, !enabled, cx);
-                                        cx.notify();
+                                    move |this, _, _, cx| {
+                                        this.toggle(harness, !enabled, cx);
                                     },
                                 ))
                             }),
@@ -210,6 +434,11 @@ impl Render for HarnessesPage {
                 widgets::section_card(&theme).children(rows).into_any_element()
             }
         };
+        let error = self
+            .error
+            .clone()
+            .map(|message| widgets::error_strip(&theme, message).into_any_element());
+        let switcher = self.render_device_switcher(&theme, cx);
 
         div()
             .id("harnesses-page")
@@ -217,17 +446,26 @@ impl Render for HarnessesPage {
             .overflow_y_scroll()
             .child(
                 widgets::page_column()
-                    .child(widgets::page_header(&theme, "Agents", None))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(widgets::page_header(&theme, "Agents", None))
+                            .child(switcher),
+                    )
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "Choose which coding agents the composer offers. Agents whose CLI \
-                             isn't installed on this device can't be enabled. This setting stays \
-                             on this device.",
+                            "Choose which coding agents the composer offers. The setting is per \
+                             device — switch devices in the header. Agents whose CLI isn't \
+                             installed on a device can't be enabled there.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
                     )
+                    .children(error)
                     .child(body),
             )
     }
