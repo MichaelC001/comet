@@ -2239,23 +2239,15 @@ impl Pickers {
     }
 }
 
-/// The "Default" pill beside a section's default choice (t3code
-/// `DefaultBadge`: outline, muted wash, 10px semibold).
+/// The "Default" marker beside a section's default choice: a ghost badge —
+/// bare muted text, no border or fill (user request; t3code draws an outline
+/// pill here).
 fn default_badge(theme: &Theme) -> gpui::Div {
     div()
-        .h(px(16.0))
-        .px(px(6.0))
-        .rounded(px(4.0))
-        .border_1()
-        .border_color(theme.border.opacity(0.7))
-        .bg(crate::theme::ink(0.04))
-        .flex()
-        .flex_row()
-        .items_center()
         .flex_none()
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme.text_muted)
+        .text_color(theme.text_muted.opacity(0.6))
         .child(SharedString::from("Default"))
 }
 
