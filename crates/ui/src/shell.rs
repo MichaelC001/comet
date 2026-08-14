@@ -849,6 +849,11 @@ pub struct Shell {
     runtime_change_error: Option<SharedString>,
     /// The one-time local→synced import stream (switch wizard progress step).
     import_task: Option<Task<()>>,
+    /// One-shot LocalImportStatus probe per attached synced runtime — restores
+    /// the pending-retry entry point after an app restart.
+    import_status_probe: Option<Task<()>>,
+    /// Guard so the probe runs once per Ready runtime, re-armed on replacement.
+    import_status_checked: bool,
     /// Title of the chat the import stream is copying right now.
     import_current: Option<SharedString>,
     /// Kept for the failed-gate "Retry" action.
@@ -1062,6 +1067,8 @@ impl Shell {
             runtime_change_error: None,
             import_task: None,
             import_current: None,
+            import_status_probe: None,
+            import_status_checked: false,
             boot,
             data_dir,
             settings,
@@ -1115,6 +1122,10 @@ impl Shell {
         // The in-place local→synced switch: once the replacement runtime is
         // attached and Ready, kick the import (or finish) from here.
         self.drive_sync_switch(cx);
+        // Restart durability: a synced boot with a recorded pending-retry
+        // restores the ImportFailed entry point the pre-restart session
+        // promised with "Later".
+        self.maybe_restore_pending_import(cx);
         let signed_out_synced = {
             let state = state.read(cx);
             state.workspace_scope == Some(WorkspaceScope::Synced)
@@ -2229,6 +2240,63 @@ impl Shell {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// One-shot per attached synced runtime: ask the engine whether a prior
+    /// import run left a recorded pending retry (`LocalImportStatus.pendingRetry`,
+    /// restart-durable via the marker) and restore the postponed
+    /// `ImportFailed` state so the account menu regains its "finish sync
+    /// setup" entry. Without this, "Later" + an app restart would strand the
+    /// remaining local rows with no discoverable retry path.
+    fn maybe_restore_pending_import(&mut self, cx: &mut Context<Self>) {
+        let (ready_synced, engine) = {
+            let state = self.state.read(cx);
+            (
+                matches!(state.connection, ConnectionStatus::Ready)
+                    && state.workspace_scope == Some(WorkspaceScope::Synced),
+                state.engine().cloned(),
+            )
+        };
+        if !ready_synced {
+            // Re-arm for the next runtime (replacement window or reconnect).
+            self.import_status_checked = false;
+            self.import_status_probe = None;
+            return;
+        }
+        if self.import_status_checked
+            || self.sync_flow != SyncFlow::Idle
+            || self.import_task.is_some()
+            || self.runtime_change_task.is_some()
+        {
+            return;
+        }
+        let Some(engine) = engine else { return };
+        self.import_status_checked = true;
+        let call = Tokio::spawn(cx, async move {
+            engine
+                .client()
+                .call(methods::LOCAL_IMPORT_STATUS, serde_json::json!({}))
+                .await
+        });
+        self.import_status_probe = Some(cx.spawn(async move |this, cx| {
+            let pending = matches!(
+                call.await,
+                Ok(Ok(status)) if status
+                    .get("pendingRetry")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false)
+            );
+            this.update(cx, |shell, cx| {
+                shell.import_status_probe = None;
+                if pending && shell.sync_flow == SyncFlow::Idle {
+                    shell.sync_flow = SyncFlow::ImportFailed { notice_open: false };
+                    shell.runtime_change_error =
+                        Some("A previous local-work import didn't finish.".into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Advance the in-place switch when the replacement runtime lands: Ready +
@@ -6460,6 +6528,155 @@ mod tests {
             .await
             .unwrap();
         release.await.unwrap();
+    }
+
+    /// The reviewer's restart scenario, end to end on real runtimes: a
+    /// partial import + "Later", then a full app restart (new bootstrap) must
+    /// still expose the retry — `LocalImportStatus.pendingRetry` survives on
+    /// disk, and the restore mapping (pending → postponed `ImportFailed` →
+    /// reopen menu action) is asserted against the restarted runtime's answer.
+    #[tokio::test]
+    async fn pending_import_retry_survives_an_app_restart() {
+        use zeron_engine::{EngineCore, EngineProfile, default_registry};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // A local-first stretch: one journal-less chat and one with a journal.
+        let local = EngineCore::assemble_with_profile(
+            EngineProfile::local(dir.path()).unwrap(),
+            std::sync::Arc::new(default_registry()),
+            zeron_proto::HarnessId::Mock,
+            None,
+        )
+        .expect("assemble local profile");
+        let device = local.device_id.clone();
+        local
+            .workspace
+            .create_chat(
+                "chat-journaled",
+                None,
+                Some(&device),
+                None,
+                Some("/tmp".into()),
+            )
+            .unwrap();
+        local
+            .workspace
+            .create_chat("chat-bare", None, Some(&device), None, Some("/tmp".into()))
+            .unwrap();
+        let journals = dir.path().join("profiles").join("local").join("journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        let (journal, _) = zeron_engine::run_journal::journal_paths(&journals, "chat-journaled");
+        std::fs::write(&journal, "{\"seq\":1,\"event\":{}}\n").unwrap();
+        local.shutdown().await;
+        drop(local);
+
+        // Signed-in synced boot (saved session), same shape as the sign-out test.
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let boot = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        let synced = crate::state::EngineHandle::bootstrap(boot.clone())
+            .await
+            .expect("saved session opens its synced profile");
+        assert_eq!(synced.engine_info().workspace_scope, WorkspaceScope::Synced);
+
+        // Break the journal copy for the journaled chat, run the import.
+        let target_journals = dir
+            .path()
+            .join("orgs")
+            .join("org_1")
+            .join("user_1")
+            .join("journals");
+        std::fs::remove_dir_all(&target_journals).unwrap();
+        std::fs::write(&target_journals, b"obstruction").unwrap();
+        let mut items = synced
+            .client()
+            .subscribe(methods::IMPORT_LOCAL_WORKSPACE, serde_json::json!({}))
+            .await
+            .expect("import stream");
+        let mut summary = None;
+        while let Some(item) = items.recv().await {
+            summary = Some(item);
+        }
+        let summary = summary.expect("summary item");
+        assert!(
+            import_summary_outcome(&summary).is_err(),
+            "injected failure must fail the summary: {summary}"
+        );
+
+        // "Later" + full app restart: stop this runtime, bootstrap a new one.
+        // The transient obstruction is gone by then (the recorded intent, not
+        // the live error, is what must survive the restart).
+        stop_synced_runtime(synced, port, dir.path())
+            .await
+            .expect("runtime releases ownership");
+        std::fs::remove_file(&target_journals).unwrap();
+        let restarted = crate::state::EngineHandle::bootstrap(boot)
+            .await
+            .expect("restart boots the synced profile");
+        assert_eq!(
+            restarted.engine_info().workspace_scope,
+            WorkspaceScope::Synced
+        );
+
+        // The restarted runtime still reports the pending retry…
+        let status = restarted
+            .client()
+            .call(methods::LOCAL_IMPORT_STATUS, serde_json::json!({}))
+            .await
+            .expect("status");
+        assert_eq!(
+            status.get("pendingRetry").and_then(|b| b.as_bool()),
+            Some(true),
+            "pending retry must survive the restart: {status}"
+        );
+        // …which restores the postponed failure state, whose menu action is
+        // the reopen entry — the retry path the pre-restart "Later" promised.
+        let restored = SyncFlow::ImportFailed { notice_open: false };
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Synced), restored),
+            Some(AccountMenuAction::RestartPending)
+        );
+
+        // Retrying on the restarted runtime completes and clears the intent.
+        let mut items = restarted
+            .client()
+            .subscribe(methods::IMPORT_LOCAL_WORKSPACE, serde_json::json!({}))
+            .await
+            .expect("retry stream");
+        let mut summary = None;
+        while let Some(item) = items.recv().await {
+            summary = Some(item);
+        }
+        assert!(
+            import_summary_outcome(&summary.expect("summary")).is_ok(),
+            "retry after clearing the obstruction is clean"
+        );
+        let status = restarted
+            .client()
+            .call(methods::LOCAL_IMPORT_STATUS, serde_json::json!({}))
+            .await
+            .expect("status");
+        assert_eq!(
+            status.get("pendingRetry").and_then(|b| b.as_bool()),
+            Some(false),
+            "clean retry clears the persisted intent: {status}"
+        );
+        restarted.shutdown().await;
     }
 
     #[tokio::test]

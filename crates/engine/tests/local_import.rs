@@ -302,12 +302,33 @@ async fn per_item_failures_surface_in_the_summary_and_leave_the_row_retryable() 
             .is_some()
     );
 
+    // The failed run records restart-durable retry intent.
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert!(
+        status.pending_retry,
+        "a failed run must persist pending-retry for the next boot"
+    );
+
     // Retry after clearing the obstruction: only the failed chat imports.
     std::fs::remove_file(&target_journals).expect("clear obstruction");
     let events = run_import(&synced);
     let (imported, skipped, errors) = raw_summary(&events);
     assert!(errors.is_empty(), "retry is clean: {errors:?}");
     assert_eq!((imported, skipped), (1, 1));
+
+    // A clean retry clears the persisted intent.
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert!(!status.pending_retry, "clean retry clears pending-retry");
 
     synced.shutdown().await;
 }
