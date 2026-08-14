@@ -666,6 +666,44 @@ fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
     }
 }
 
+const IMPORT_PROBE_MAX_ATTEMPTS: u8 = 4;
+
+/// What a LocalImportStatus probe result means for the shell. Pure so the
+/// re-arm rules are testable: an error or a mistimed pending result must
+/// DEFER (probe again later), never permanently swallow the recovery path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportProbeOutcome {
+    /// Recorded pending retry + idle flow: restore the postponed failure.
+    Restore,
+    /// Definitive answer, nothing to restore — stop probing this runtime.
+    Settle,
+    /// No usable answer (RPC failed) or the answer arrived while the flow
+    /// was busy — keep the probe armed for a later state change.
+    Defer,
+}
+
+fn import_probe_outcome(status: Option<&serde_json::Value>, flow: SyncFlow) -> ImportProbeOutcome {
+    let Some(status) = status else {
+        return ImportProbeOutcome::Defer;
+    };
+    let pending = status
+        .get("pendingRetry")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    match (pending, flow) {
+        (false, _) => ImportProbeOutcome::Settle,
+        (true, SyncFlow::Idle) => ImportProbeOutcome::Restore,
+        (true, _) => ImportProbeOutcome::Defer,
+    }
+}
+
+/// The manual "Import local work" account-menu row: the always-available
+/// recovery route on a synced runtime with importable local rows — it works
+/// even when the pending marker itself could not be written.
+fn show_manual_import_row(scope: Option<WorkspaceScope>, flow: SyncFlow, available: usize) -> bool {
+    scope == Some(WorkspaceScope::Synced) && flow == SyncFlow::Idle && available > 0
+}
+
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
         Some(WorkspaceScope::Local) => match flow {
@@ -852,8 +890,18 @@ pub struct Shell {
     /// One-shot LocalImportStatus probe per attached synced runtime — restores
     /// the pending-retry entry point after an app restart.
     import_status_probe: Option<Task<()>>,
-    /// Guard so the probe runs once per Ready runtime, re-armed on replacement.
+    /// Guard so the probe settles once per Ready runtime, re-armed on
+    /// replacement, on RPC failure (bounded retries), and when a pending
+    /// result had to be deferred because the flow was busy.
     import_status_checked: bool,
+    /// Failed probe attempts for the current runtime (bounded so an engine
+    /// that keeps erroring cannot hot-loop the probe).
+    import_status_attempts: u8,
+    /// Importable local rows (chats + spaces) reported by the last successful
+    /// probe — drives the manual "Import local work" account-menu entry, the
+    /// recovery route that works even when the marker itself cannot be
+    /// written.
+    local_import_available: usize,
     /// Title of the chat the import stream is copying right now.
     import_current: Option<SharedString>,
     /// Kept for the failed-gate "Retry" action.
@@ -1069,6 +1117,8 @@ impl Shell {
             import_current: None,
             import_status_probe: None,
             import_status_checked: false,
+            import_status_attempts: 0,
+            local_import_available: 0,
             boot,
             data_dir,
             settings,
@@ -2260,10 +2310,14 @@ impl Shell {
         if !ready_synced {
             // Re-arm for the next runtime (replacement window or reconnect).
             self.import_status_checked = false;
+            self.import_status_attempts = 0;
+            self.local_import_available = 0;
             self.import_status_probe = None;
             return;
         }
         if self.import_status_checked
+            || self.import_status_probe.is_some()
+            || self.import_status_attempts >= IMPORT_PROBE_MAX_ATTEMPTS
             || self.sync_flow != SyncFlow::Idle
             || self.import_task.is_some()
             || self.runtime_change_task.is_some()
@@ -2271,7 +2325,6 @@ impl Shell {
             return;
         }
         let Some(engine) = engine else { return };
-        self.import_status_checked = true;
         let call = Tokio::spawn(cx, async move {
             engine
                 .client()
@@ -2279,24 +2332,50 @@ impl Shell {
                 .await
         });
         self.import_status_probe = Some(cx.spawn(async move |this, cx| {
-            let pending = matches!(
-                call.await,
-                Ok(Ok(status)) if status
-                    .get("pendingRetry")
-                    .and_then(|b| b.as_bool())
-                    .unwrap_or(false)
-            );
+            let status = match call.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(join) => Err(join.to_string()),
+            };
             this.update(cx, |shell, cx| {
                 shell.import_status_probe = None;
-                if pending && shell.sync_flow == SyncFlow::Idle {
-                    shell.sync_flow = SyncFlow::ImportFailed { notice_open: false };
-                    shell.runtime_change_error =
-                        Some("A previous local-work import didn't finish.".into());
-                    cx.notify();
+                match import_probe_outcome(status.as_ref().ok(), shell.sync_flow) {
+                    ImportProbeOutcome::Restore => {
+                        shell.import_status_checked = true;
+                        shell.apply_probe_available(status.as_ref().ok());
+                        shell.sync_flow = SyncFlow::ImportFailed { notice_open: false };
+                        shell.runtime_change_error =
+                            Some("A previous local-work import didn't finish.".into());
+                        cx.notify();
+                    }
+                    ImportProbeOutcome::Settle => {
+                        shell.import_status_checked = true;
+                        shell.apply_probe_available(status.as_ref().ok());
+                        cx.notify();
+                    }
+                    // A failed call, or a pending result that arrived while
+                    // the flow was busy: leave the guard unset so a later
+                    // state change re-probes instead of hiding the recovery
+                    // entry for the rest of the runtime.
+                    ImportProbeOutcome::Defer => {
+                        if status.is_err() {
+                            shell.import_status_attempts =
+                                shell.import_status_attempts.saturating_add(1);
+                        }
+                    }
                 }
             })
             .ok();
         }));
+    }
+
+    fn apply_probe_available(&mut self, status: Option<&serde_json::Value>) {
+        let count = |key: &str| {
+            status
+                .and_then(|s| s.get(key))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize
+        };
+        self.local_import_available = count("availableChats") + count("availableSpaces");
     }
 
     /// Advance the in-place switch when the replacement runtime lands: Ready +
@@ -3854,6 +3933,34 @@ impl Shell {
                     };
                     menu.child(row).child(popover::menu_separator())
                 })
+                // Manual recovery route: importable local rows on a synced
+                // runtime get a standing entry regardless of marker state —
+                // this is the path that still works when the pending marker
+                // itself could not be written.
+                .when(
+                    show_manual_import_row(
+                        self.state.read(cx).workspace_scope,
+                        self.sync_flow,
+                        self.local_import_available,
+                    ),
+                    |menu| {
+                        menu.child(
+                            popover::menu_row(theme, false, "user-menu-import-local")
+                                .id("user-menu-import-local")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_user_menu(cx);
+                                    this.spawn_local_import(cx);
+                                }))
+                                .child(
+                                    icon(icons::GLOBAL)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Import local work")),
+                        )
+                        .child(popover::menu_separator())
+                    },
+                )
                 .child(
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
@@ -6927,6 +7034,59 @@ mod tests {
             account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
             Some(AccountMenuAction::SignOut)
         );
+    }
+
+    #[test]
+    fn probe_outcomes_never_swallow_the_recovery_path() {
+        let pending = serde_json::json!({ "pendingRetry": true, "availableChats": 2 });
+        let clear = serde_json::json!({ "pendingRetry": false });
+
+        // A failed RPC defers — the guard must stay unset for a later retry.
+        assert_eq!(
+            import_probe_outcome(None, SyncFlow::Idle),
+            ImportProbeOutcome::Defer
+        );
+        // Pending + idle restores.
+        assert_eq!(
+            import_probe_outcome(Some(&pending), SyncFlow::Idle),
+            ImportProbeOutcome::Restore
+        );
+        // Pending that lands while the flow is busy is DEFERRED, not dropped.
+        assert_eq!(
+            import_probe_outcome(Some(&pending), SyncFlow::Importing { done: 1, total: 2 }),
+            ImportProbeOutcome::Defer
+        );
+        // A definitive "nothing pending" settles the probe.
+        assert_eq!(
+            import_probe_outcome(Some(&clear), SyncFlow::Idle),
+            ImportProbeOutcome::Settle
+        );
+    }
+
+    #[test]
+    fn manual_import_row_is_the_markerless_recovery_route() {
+        // Synced + idle + importable rows: visible.
+        assert!(show_manual_import_row(
+            Some(WorkspaceScope::Synced),
+            SyncFlow::Idle,
+            3
+        ));
+        // Nothing importable, wrong scope, or a busy flow: hidden.
+        assert!(!show_manual_import_row(
+            Some(WorkspaceScope::Synced),
+            SyncFlow::Idle,
+            0
+        ));
+        assert!(!show_manual_import_row(
+            Some(WorkspaceScope::Local),
+            SyncFlow::Idle,
+            3
+        ));
+        assert!(!show_manual_import_row(
+            Some(WorkspaceScope::Synced),
+            SyncFlow::Importing { done: 0, total: 3 },
+            3
+        ));
     }
 
     #[test]
